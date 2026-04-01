@@ -30,8 +30,15 @@ class Args:
     compute_exact_diag: bool = True
 
     # Heisenberg chain
+    # N: int = 12
+    # J: float = 0.25
+    # pbc: bool = True
+    # sign_rule: bool = False
+
+    # J1-J2 chain
     N: int = 12
-    J: float = 0.25
+    J1: float = 1.0
+    J2: float = 0.5
     pbc: bool = True
     sign_rule: bool = False
 
@@ -46,12 +53,12 @@ class Args:
     optimizer: str = "adam"
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
-    transition_steps: int = 50_000
+    transition_steps: int = 100_000
     use_phase_jacobian_baseline: bool = True
     phase_jacobian_baseline_eps: float = 1e-8
 
     # PPO / clipped objectives
-    ppo_epochs: int = 1
+    ppo_epochs: int = 4
     normalize_advantage: bool = True
     ppo_clip_eps: float = 1e-3
 
@@ -282,14 +289,25 @@ def main(cfg: Args) -> None:
             mode=cfg.wandb_mode,
         )
 
-    hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
-    graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+    # hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
+    # graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+
+    # H_nk = nk.operator.Heisenberg(
+    #     hi,
+    #     graph=graph,
+    #     J=cfg.J,
+    #     sign_rule=cfg.sign_rule,
+    # )
+
+    hi = nk.hilbert.Spin(s=0.5, N=cfg.N)
+
+    g = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
 
     H_nk = nk.operator.Heisenberg(
-        hi,
-        graph=graph,
-        J=cfg.J,
-        sign_rule=cfg.sign_rule,
+        hilbert=hi,
+        graph=g,
+        J=[cfg.J1, cfg.J2],
+        sign_rule=[False, False],
     )
 
     E_gs_exact = None
@@ -332,6 +350,10 @@ def main(cfg: Args) -> None:
     )
 
     params0 = vstate.variables["params"]
+
+    n_params = sum(x.size for x in jax.tree_util.tree_leaves(params0))
+    print(f"Number of parameters: {n_params:,}")
+    
     sampler_state0 = vstate.sampler_state
     chain_length = vstate.chain_length
     N = cfg.N
@@ -404,6 +426,8 @@ def main(cfg: Args) -> None:
             jnp.cos(new_phase - old_phase),
         )
 
+        is_ratio = jax.lax.stop_gradient(ratio_real)
+
         if cfg.phase_loss_type == "ratio":
             denom = jnp.where(
                 jnp.abs(old_phase) >= cfg.phase_ratio_tau,
@@ -416,8 +440,8 @@ def main(cfg: Args) -> None:
                 1.0 - cfg.phase_clip_eps,
                 1.0 + cfg.phase_clip_eps,
             )
-            surrogate_phase_1 = ratio_phase * adv_phase
-            surrogate_phase_2 = clipped_ratio_phase * adv_phase
+            surrogate_phase_1 = is_ratio * ratio_phase * adv_phase
+            surrogate_phase_2 = is_ratio * clipped_ratio_phase * adv_phase
             loss_phase = jnp.mean(jnp.maximum(surrogate_phase_1, surrogate_phase_2))
             phase_stat = ratio_phase
 
@@ -427,8 +451,8 @@ def main(cfg: Args) -> None:
                 -cfg.phase_delta_clip,
                 cfg.phase_delta_clip,
             )
-            surrogate_phase_1 = phase_delta * adv_phase
-            surrogate_phase_2 = clipped_phase_delta * adv_phase
+            surrogate_phase_1 = is_ratio * phase_delta * adv_phase
+            surrogate_phase_2 = is_ratio * clipped_phase_delta * adv_phase
             loss_phase = jnp.mean(jnp.maximum(surrogate_phase_1, surrogate_phase_2))
             if cfg.phase_delta_l2_coef > 0.0:
                 loss_phase = loss_phase + cfg.phase_delta_l2_coef * jnp.mean(phase_delta**2)
