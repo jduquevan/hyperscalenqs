@@ -29,6 +29,11 @@ class Args:
     jax_platform_name: str = "gpu"
     compute_exact_diag: bool = True
 
+    # Ising
+    # N: int = 12
+    # Gamma: float = -1.0
+    # V: float = -1.0
+
     # Heisenberg chain
     # N: int = 12
     # J: float = 0.25
@@ -43,17 +48,18 @@ class Args:
     sign_rule: bool = False
 
     # Sampling / AR setup
-    n_samples: int = 1024
+    n_samples: int = 2048
     machine_pow: int = 2
 
     # Optimizer
-    lr: float = 3e-5
+    lr: float = 1e-5
     final_lr: float = 1e-7
     n_iter: int = 1_000_000
     optimizer: str = "adam"
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
-    transition_steps: int = 100_000
+    # transition_steps: int = 100_000
+    transition_steps: int = 100000
     use_phase_jacobian_baseline: bool = True
     phase_jacobian_baseline_eps: float = 1e-8
 
@@ -82,7 +88,7 @@ class Args:
     phase_init_std: float = 1e-3
 
     # Logging / eval
-    eval_every: int = 1000
+    eval_every: int = 200
     eval_n_samples: int = 1048576
     eval_batch_size: int = 2048
     eval_n_discard_per_chain: int = 0
@@ -136,7 +142,7 @@ def make_tx(cfg: Args):
         peak_value=1e-4,      # start modestly
         pct_start=0.15,
         div_factor=10.0,      # init = 1e-5
-        final_div_factor=100.0,  # final = 1e-7
+        final_div_factor=200.0,  # final = 1e-8
     )
 
     opt = cfg.optimizer.lower()
@@ -299,16 +305,22 @@ def main(cfg: Args) -> None:
     #     sign_rule=cfg.sign_rule,
     # )
 
-    hi = nk.hilbert.Spin(s=0.5, N=cfg.N)
+    # J2/J1
+    # hi = nk.hilbert.Spin(s=0.5, N=cfg.N)
 
-    g = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
+    # g = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
 
-    H_nk = nk.operator.Heisenberg(
-        hilbert=hi,
-        graph=g,
-        J=[cfg.J1, cfg.J2],
-        sign_rule=[False, False],
-    )
+    # H_nk = nk.operator.Heisenberg(
+    #     hilbert=hi,
+    #     graph=g,
+    #     J=[cfg.J1, cfg.J2],
+    #     sign_rule=[False, False],
+    # )
+
+    hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
+    graph = nk.graph.Chain(length=cfg.N, pbc=True)
+
+    H_nk = nk.operator.Ising(hi, graph, h=-cfg.Gamma, J=cfg.V)
 
     E_gs_exact = None
     if cfg.compute_exact_diag:

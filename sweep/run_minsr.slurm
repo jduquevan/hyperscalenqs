@@ -14,11 +14,11 @@
 # Define how many nodes you need. Here, we ask for 1 node.
 #SBATCH -N 1 #nodes
 #SBATCH -n 1 #tasks
-#SBATCH --mem=32G
+#SBATCH --mem=16G
 #SBATCH --time=0-01:09:00
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --partition=long
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=6
 
 # Submit jobs.
 module purge
@@ -29,10 +29,10 @@ source .venv/bin/activate
 
 # Define all arguments
 SEED=${1}
-RUN_NAME=${2:-qps_seed_${SEED}}
+RUN_NAME=${2:-minsr_seed_${SEED}}
 
 # Construct the full command
-CMD="python src/qps.py seed=${SEED} wandb_run_name=${RUN_NAME}"
+CMD="python src/minsr.py seed=${SEED} wandb_run_name=${RUN_NAME}"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"

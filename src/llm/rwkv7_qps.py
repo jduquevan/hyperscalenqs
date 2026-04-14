@@ -57,9 +57,9 @@ class Args:
 
     # PPO / optimization
     n_iter: int = 1000000
-    batch_size: int = 128
+    batch_size: int = 64
     eval_n_samples: int = 4096
-    eval_batch_size: int = 64
+    eval_batch_size: int = 128
     eval_n_discard_per_chain: int = 0
     ppo_epochs: int = 4
     sampler_uses_variables_dict: bool = True
