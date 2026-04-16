@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import os
 import math
-from dataclasses import dataclass
-from typing import Optional
 
 import hydra
 import wandb
+from dataclasses import dataclass
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
 from pathlib import Path
+from typing import Optional
 
 os.environ.setdefault("JAX_PLATFORM_NAME", "gpu")
 
@@ -29,37 +29,41 @@ class Args:
     jax_platform_name: str = "gpu"
     compute_exact_diag: bool = True
 
+    # Hamiltonian
+    hamiltonian: str = "ising"   # {"ising", "heisenberg", "j1j2"}
+
+    N: int = 12
+    pbc: bool = True
+
     # Ising
-    # N: int = 12
-    # Gamma: float = -1.0
-    # V: float = -1.0
+    Gamma: float = -1.0
+    V: float = -1.0
 
     # Heisenberg chain
-    # N: int = 12
-    # J: float = 0.25
-    # pbc: bool = True
-    # sign_rule: bool = False
-
-    # J1-J2 chain
-    N: int = 12
-    J1: float = 1.0
-    J2: float = 0.5
-    pbc: bool = True
+    J: float = 0.25
     sign_rule: bool = False
 
+    # J1-J2 chain
+    J1: float = 1.0
+    J2: float = 0.5
+    j1j2_sign_rule: bool = False
+
     # Sampling / AR setup
-    n_samples: int = 2048
+    n_samples: int = 1024
     machine_pow: int = 2
 
     # Optimizer
     lr: float = 1e-5
-    final_lr: float = 1e-7
+    peak_lr: float = 1e-4
+    pct_start: float = 0.15
+    div_factor: float = 10.0
+    final_div_factor: float = 200.0
     n_iter: int = 1_000_000
     optimizer: str = "adam"
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
     # transition_steps: int = 100_000
-    transition_steps: int = 100000
+    transition_steps: int = 40000
     use_phase_jacobian_baseline: bool = True
     phase_jacobian_baseline_eps: float = 1e-8
 
@@ -103,6 +107,7 @@ class Args:
     log_gradient_info: bool = False
     output_directory: Optional[str] = "."
     wandb_directory: Optional[str] = "."
+    wandb_tags: Optional[str] = None
 
 
 ConfigStore.instance().store(name="config", node=Args)
@@ -128,21 +133,48 @@ def tree_cast_like(tree, like_tree):
     return jax.tree_util.tree_map(lambda x, y: x.astype(y.dtype), tree, like_tree)
 
 
+def build_hamiltonian(cfg: Args):
+    hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
+
+    if cfg.hamiltonian == "ising":
+        graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+        H_nk = nk.operator.Ising(hi, graph, h=-cfg.Gamma, J=cfg.V)
+
+    elif cfg.hamiltonian == "heisenberg":
+        graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+        H_nk = nk.operator.Heisenberg(
+            hi,
+            graph=graph,
+            J=cfg.J,
+            sign_rule=cfg.sign_rule,
+        )
+
+    elif cfg.hamiltonian == "j1j2":
+        graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
+        H_nk = nk.operator.Heisenberg(
+            hilbert=hi,
+            graph=graph,
+            J=[cfg.J1, cfg.J2],
+            sign_rule=[cfg.j1j2_sign_rule, cfg.j1j2_sign_rule],
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown hamiltonian: {cfg.hamiltonian}. "
+            "Choose from {'ising', 'heisenberg', 'j1j2'}."
+        )
+
+    return hi, H_nk
+
+
 def make_tx(cfg: Args):
-    # lr_schedule = optax.exponential_decay(
-    #     init_value=cfg.lr,
-    #     transition_steps=cfg.transition_steps,
-    #     decay_rate=cfg.decay_rate,
-    #     staircase=True,
-    #     end_value=cfg.final_lr,
-    # )
 
     lr_schedule = optax.schedules.cosine_onecycle_schedule(
         transition_steps=cfg.transition_steps,
-        peak_value=1e-4,      # start modestly
-        pct_start=0.15,
-        div_factor=10.0,      # init = 1e-5
-        final_div_factor=200.0,  # final = 1e-8
+        peak_value=cfg.peak_lr,
+        pct_start=cfg.pct_start,
+        div_factor=cfg.div_factor,
+        final_div_factor=cfg.final_div_factor,
     )
 
     opt = cfg.optimizer.lower()
@@ -286,41 +318,19 @@ def main(cfg: Args) -> None:
 
     if cfg.wandb_mode != "disabled":
         Path(cfg.wandb_directory).mkdir(parents=True, exist_ok=True)
+        tags = None if cfg.wandb_tags is None else [cfg.wandb_tags]
+
         wandb.init(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             name=cfg.wandb_run_name,
+            tags=tags,
             config=OmegaConf.to_container(OmegaConf.structured(cfg), resolve=True),
             dir=cfg.wandb_directory,
             mode=cfg.wandb_mode,
         )
 
-    # hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
-    # graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
-
-    # H_nk = nk.operator.Heisenberg(
-    #     hi,
-    #     graph=graph,
-    #     J=cfg.J,
-    #     sign_rule=cfg.sign_rule,
-    # )
-
-    # J2/J1
-    # hi = nk.hilbert.Spin(s=0.5, N=cfg.N)
-
-    # g = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
-
-    # H_nk = nk.operator.Heisenberg(
-    #     hilbert=hi,
-    #     graph=g,
-    #     J=[cfg.J1, cfg.J2],
-    #     sign_rule=[False, False],
-    # )
-
-    hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
-    graph = nk.graph.Chain(length=cfg.N, pbc=True)
-
-    H_nk = nk.operator.Ising(hi, graph, h=-cfg.Gamma, J=cfg.V)
+    hi, H_nk = build_hamiltonian(cfg)
 
     E_gs_exact = None
     if cfg.compute_exact_diag:
@@ -624,8 +634,14 @@ def main(cfg: Args) -> None:
             e_real.shape[0],
         )
 
-
     def evaluate(state):
+        extra_metrics = {
+            "eval_E_var_real": float("nan"),
+            "eval_abs_E_imag_mean": float("nan"),
+            "eval_V_score": float("nan"),
+            "eval_n_samples_used": float("nan"),
+        }
+
         if cfg.eval_mode == "exact":
             full_vstate = nk.vqs.FullSumState(
                 hi,
@@ -640,7 +656,16 @@ def main(cfg: Args) -> None:
 
             energy_real = float(jnp.real(energy))
             energy_imag = float(jnp.imag(energy))
-            extra_metrics = {}
+
+            variance_real = float(jnp.real(exact_stats.variance))
+            denom = max(energy_real * energy_real, 1e-12)
+            v_score = float(cfg.N * variance_real / denom)
+
+            extra_metrics.update({
+                "eval_E_var_real": variance_real,
+                "eval_V_score": v_score,
+                "eval_n_samples_used": float(hi.n_states),
+            })
 
         elif cfg.eval_mode == "sample":
             eval_vstate.parameters = state.params
@@ -680,12 +705,12 @@ def main(cfg: Args) -> None:
             denom = max(energy_real * energy_real, 1e-12)
             v_score = float(cfg.N * variance_real / denom)
 
-            extra_metrics = {
+            extra_metrics.update({
                 "eval_E_var_real": variance_real,
                 "eval_abs_E_imag_mean": abs_imag_mean,
                 "eval_V_score": v_score,
                 "eval_n_samples_used": total_n,
-            }
+            })
 
         else:
             raise ValueError(f"Unknown eval_mode: {cfg.eval_mode}")
@@ -693,15 +718,14 @@ def main(cfg: Args) -> None:
         out = {
             "eval_E_mean_real": energy_real,
             "eval_E_mean_imag": energy_imag,
+            **extra_metrics,
         }
-        out.update(extra_metrics)
 
         if E_gs_exact is not None:
             out["eval_E_exact"] = float(E_gs_exact)
             out["eval_rel_error_exact"] = float(abs((energy_real - E_gs_exact) / E_gs_exact))
 
         return out
-
 
     @partial(jax.jit, donate_argnums=(0, 1))
     def train_iter(state, sampler_state):
@@ -859,14 +883,10 @@ def main(cfg: Args) -> None:
                 f"[eval] it={it:04d}  "
                 f"E_real={eval_metrics['eval_E_mean_real']:.8f}  "
                 f"E_imag={eval_metrics['eval_E_mean_imag']:.8e}  "
+                f"Var_real={eval_metrics['eval_E_var_real']:.8e}  "
+                f"|E_imag|={eval_metrics['eval_abs_E_imag_mean']:.8e}  "
+                f"V_score={eval_metrics['eval_V_score']:.8e}  "
             )
-
-            if cfg.eval_mode == "sample":
-                eval_msg += (
-                    f"Var_real={eval_metrics['eval_E_var_real']:.8e}  "
-                    f"|E_imag|={eval_metrics['eval_abs_E_imag_mean']:.8e}  "
-                    f"V_score={eval_metrics['eval_V_score']:.8e}  "
-                )
 
             if "eval_rel_error_exact" in eval_metrics:
                 eval_msg += (

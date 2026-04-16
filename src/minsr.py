@@ -27,24 +27,24 @@ class Args:
     jax_platform_name: str = "gpu"
     compute_exact_diag: bool = True
 
-    # Ising
-    # N: int = 12
-    # Gamma: float = -1.0
-    # V: float = -1.0
+    # Hamiltonian
+    hamiltonian: str = "ising"   # {"ising", "heisenberg", "j1j2"}
 
-    # Heisenberg chain
-    # N: int = 12
-    # J: float = 0.25
-    # pbc: bool = True
-    # sign_rule: bool = False
-
-    # J2/J1
     N: int = 12
-    J1: float = 1.0
-    J2: float = 0.5
     pbc: bool = True
+
+    # Ising
     Gamma: float = -1.0
     V: float = -1.0
+
+    # Heisenberg chain
+    J: float = 0.25
+    sign_rule: bool = False
+
+    # J1-J2 chain
+    J1: float = 1.0
+    J2: float = 0.5
+    j1j2_sign_rule: bool = False
 
     # Sampling / AR
     n_samples: int = 1024
@@ -77,21 +77,49 @@ class Args:
     eval_n_discard_per_chain: int = 0
     eval_exact_chunk_size: Optional[int] = None
 
-    # LR Scheduler
-    lr_peak: float = 3e-4          # peak LR
-    lr_div_factor: float = 10.0    # init = 2e-4
-    lr_final_div_factor: float = 100.0  # final = 2e-6
-    lr_pct_start: float = 0.15
-    transition_steps: int = 4000
-
     wandb_project: str = "hyperscalenqs"
     wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
     wandb_directory: Optional[str] = "."
+    wandb_tags: Optional[str] = None
 
 
 ConfigStore.instance().store(name="config", node=Args)
+
+
+def build_hamiltonian(cfg: Args):
+    hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
+
+    if cfg.hamiltonian == "ising":
+        graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+        H_nk = nk.operator.Ising(hi, graph, h=-cfg.Gamma, J=cfg.V)
+
+    elif cfg.hamiltonian == "heisenberg":
+        graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+        H_nk = nk.operator.Heisenberg(
+            hi,
+            graph=graph,
+            J=cfg.J,
+            sign_rule=cfg.sign_rule,
+        )
+
+    elif cfg.hamiltonian == "j1j2":
+        graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
+        H_nk = nk.operator.Heisenberg(
+            hilbert=hi,
+            graph=graph,
+            J=[cfg.J1, cfg.J2],
+            sign_rule=[cfg.j1j2_sign_rule, cfg.j1j2_sign_rule],
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown hamiltonian: {cfg.hamiltonian}. "
+            "Choose from {'ising', 'heisenberg', 'j1j2'}."
+        )
+
+    return hi, H_nk
 
 
 class GRULayer(nn.Module):
@@ -210,40 +238,20 @@ def main(cfg: Args) -> None:
 
     if cfg.wandb_mode != "disabled":
         Path(cfg.wandb_directory).mkdir(parents=True, exist_ok=True)
+        tags = None if cfg.wandb_tags is None else [cfg.wandb_tags]
+
         wandb.init(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             name=cfg.wandb_run_name,
+            tags=tags,
             config=OmegaConf.to_container(OmegaConf.structured(cfg), resolve=True),
             dir=cfg.wandb_directory,
             mode=cfg.wandb_mode,
         )
         
-    # hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
-    # graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
-
-    # H_nk = nk.operator.Heisenberg(
-    #     hi,
-    #     graph=graph,
-    #     J=cfg.J,
-    #     sign_rule=cfg.sign_rule,
-    # )   
-
-    # Match qps.py Hamiltonian
-    hi = nk.hilbert.Spin(s=0.5, N=cfg.N)
-    g = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
-
-    H_nk = nk.operator.Heisenberg(
-        hilbert=hi,
-        graph=g,
-        J=[cfg.J1, cfg.J2],
-        sign_rule=[False, False],
-    )
-
-    # hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
-    # graph = nk.graph.Chain(length=cfg.N, pbc=True)
-
-    # H_nk = nk.operator.Ising(hi, graph, h=-cfg.Gamma, J=cfg.V)
+    hi, H_nk = build_hamiltonian(cfg)
+    H = H_nk.to_jax_operator() if hasattr(H_nk, "to_jax_operator") else H_nk
 
     E_gs_exact = None
     if cfg.compute_exact_diag:
@@ -274,21 +282,6 @@ def main(cfg: Args) -> None:
         n_discard_per_chain=0,
     )
 
-    lr_schedule = optax.schedules.cosine_onecycle_schedule(
-        transition_steps=cfg.transition_steps,
-        peak_value=cfg.lr_peak,
-        pct_start=cfg.lr_pct_start,
-        div_factor=cfg.lr_div_factor,
-        final_div_factor=cfg.lr_final_div_factor,
-    )
-
-    lr_schedule = optax.exponential_decay(
-        init_value=1e-3,
-        transition_steps=1500,
-        decay_rate=0.5,
-        staircase=True,
-    )
-
     # This is the key line: use_ntk=True => minSR
     driver = nk.driver.VMC_SR(
         hamiltonian=H_nk,
@@ -313,6 +306,13 @@ def main(cfg: Args) -> None:
     )
 
     def evaluate():
+        extra_metrics = {
+            "eval_E_var_real": float("nan"),
+            "eval_abs_E_imag_mean": float("nan"),
+            "eval_V_score": float("nan"),
+            "eval_n_samples_used": float("nan"),
+        }
+
         if cfg.eval_mode == "exact":
             full_vstate = nk.vqs.FullSumState(
                 hi,
@@ -321,59 +321,62 @@ def main(cfg: Args) -> None:
                 chunk_size=cfg.eval_exact_chunk_size,
                 seed=cfg.seed + 2,
             )
-            exact_stats = full_vstate.expect(H_nk)
-            energy = exact_stats.mean
-            e_real = float(jnp.real(energy))
-            e_imag = float(jnp.imag(energy))
-            out = {
-                "eval_E_mean_real": e_real,
-                "eval_E_mean_imag": e_imag,
-            }
-        else:
+
+            stats = full_vstate.expect(H_nk)
+            energy = stats.mean
+
+            energy_real = float(jnp.real(energy))
+            energy_imag = float(jnp.imag(energy))
+
+            try:
+                variance_real = float(jnp.real(stats.variance))
+            except Exception:
+                variance_real = float("nan")
+
+            denom = max(energy_real * energy_real, 1e-12)
+            v_score = float(cfg.N * variance_real / denom) if not math.isnan(variance_real) else float("nan")
+
+            extra_metrics.update({
+                "eval_E_var_real": variance_real,
+                "eval_V_score": v_score,
+                "eval_n_samples_used": float(hi.n_states),
+            })
+
+        elif cfg.eval_mode == "sample":
             eval_vstate.parameters = vstate.parameters
+            stats = eval_vstate.expect(H_nk)
+            energy = stats.mean
 
-            total_real = 0.0
-            total_real_sq = 0.0
-            total_imag = 0.0
-            total_abs_imag = 0.0
-            total_n = 0
-            n_remaining = cfg.eval_n_samples
+            energy_real = float(jnp.real(energy))
+            energy_imag = float(jnp.imag(energy))
 
-            while n_remaining > 0:
-                eval_vstate.sample()
-                stats = eval_vstate.expect(H_nk)
-                e = stats.mean
+            try:
+                variance_real = float(jnp.real(stats.variance))
+            except Exception:
+                variance_real = float("nan")
 
-                # crude chunked accumulation
-                cur_n = min(cfg.eval_batch_size, n_remaining)
-                er = float(jnp.real(e))
-                ei = float(jnp.imag(e))
+            denom = max(energy_real * energy_real, 1e-12)
+            v_score = float(cfg.N * variance_real / denom) if not math.isnan(variance_real) else float("nan")
 
-                total_real += cur_n * er
-                total_real_sq += cur_n * (er ** 2)
-                total_imag += cur_n * ei
-                total_abs_imag += cur_n * abs(ei)
-                total_n += cur_n
-                n_remaining -= cur_n
+            extra_metrics.update({
+                "eval_E_var_real": variance_real,
+                "eval_abs_E_imag_mean": float("nan"),
+                "eval_V_score": v_score,
+                "eval_n_samples_used": int(cfg.eval_batch_size),
+            })
 
-            e_real = total_real / total_n
-            var_real = max(total_real_sq / total_n - e_real ** 2, 0.0)
-            e_imag = total_imag / total_n
-            abs_imag_mean = total_abs_imag / total_n
-            denom = max(e_real * e_real, 1e-12)
+        else:
+            raise ValueError(f"Unknown eval_mode: {cfg.eval_mode}")
 
-            out = {
-                "eval_E_mean_real": e_real,
-                "eval_E_mean_imag": e_imag,
-                "eval_E_var_real": var_real,
-                "eval_abs_E_imag_mean": abs_imag_mean,
-                "eval_V_score": float(cfg.N * var_real / denom),
-                "eval_n_samples_used": total_n,
-            }
+        out = {
+            "eval_E_mean_real": energy_real,
+            "eval_E_mean_imag": energy_imag,
+            **extra_metrics,
+        }
 
         if E_gs_exact is not None:
             out["eval_E_exact"] = float(E_gs_exact)
-            out["eval_rel_error_exact"] = float(abs((out["eval_E_mean_real"] - E_gs_exact) / E_gs_exact))
+            out["eval_rel_error_exact"] = float(abs((energy_real - E_gs_exact) / E_gs_exact))
 
         return out
 
@@ -386,32 +389,77 @@ def main(cfg: Args) -> None:
             e_real = float(jnp.real(e))
             e_imag = float(jnp.imag(e))
 
-            msg = f"it={it:04d}  E_real={e_real:.8f}  E_imag={e_imag:.3e}"
+            try:
+                e_var_real = float(jnp.real(stats.variance))
+            except Exception:
+                e_var_real = float("nan")
+
+            try:
+                e_std_real = math.sqrt(max(e_var_real, 0.0))
+            except Exception:
+                e_std_real = float("nan")
+
+            param_norm = float(optax.global_norm(vstate.parameters))
+
+            msg = (
+                f"it={it:04d}  "
+                f"E_real={e_real:.8f} ± {e_std_real:.8f}  "
+                f"E_imag={e_imag:.3e}  "
+                f"||θ||={param_norm:.3e}"
+            )
             if E_gs_exact is not None:
                 rel_err = abs((e_real - E_gs_exact) / E_gs_exact)
-                msg += f"  E_exact={E_gs_exact:.8f}  rel_err={rel_err:.3e}"
+                msg += f"  E_exact={E_gs_exact:.8f}  rel_err_batch={rel_err:.3e}"
             print(msg)
 
             if cfg.wandb_mode != "disabled":
                 log_dict = {
                     "iter": it,
+                    "loss": float("nan"),
+                    "loss_real": float("nan"),
+                    "loss_phase": float("nan"),
                     "E_mean_real": e_real,
+                    "E_std_real": e_std_real,
                     "E_mean_imag": e_imag,
+                    "E_std_imag": float("nan"),
+                    "grad_norm": float("nan"),
+                    "param_norm": param_norm,
+                    "ratio_mean": float("nan"),
+                    "clip_frac": float("nan"),
+                    "approx_kl": float("nan"),
+                    "phase_old_mean": float("nan"),
+                    "phase_new_mean": float("nan"),
+                    "phase_delta_mean": float("nan"),
+                    "phase_delta_rms": float("nan"),
+                    "phase_stat_mean": float("nan"),
+                    "phase_stat_abs_mean": float("nan"),
                     "step_count": int(driver.step_count),
                 }
                 if E_gs_exact is not None:
-                    log_dict["E_exact"] = E_gs_exact
-                    log_dict["rel_error_exact"] = rel_err
+                    log_dict["E_exact"] = float(E_gs_exact)
+                    log_dict["rel_error_exact"] = float(rel_err)
                 wandb.log(log_dict, step=it)
 
         if cfg.eval_every > 0 and (it % cfg.eval_every == 0 or it == cfg.n_iter - 1):
             eval_metrics = evaluate()
-            print(
+
+            eval_msg = (
                 f"[eval] it={it:04d}  "
                 f"E_real={eval_metrics['eval_E_mean_real']:.8f}  "
-                f"E_imag={eval_metrics['eval_E_mean_imag']:.3e}  "
-                f"rel_err={eval_metrics.get('eval_rel_error_exact', float('nan')):.3e}"
+                f"E_imag={eval_metrics['eval_E_mean_imag']:.8e}  "
+                f"Var_real={eval_metrics['eval_E_var_real']:.8e}  "
+                f"|E_imag|={eval_metrics['eval_abs_E_imag_mean']:.8e}  "
+                f"V_score={eval_metrics['eval_V_score']:.8e}  "
             )
+
+            if "eval_rel_error_exact" in eval_metrics:
+                eval_msg += (
+                    f"E_exact={eval_metrics['eval_E_exact']:.8f}"
+                    f"  rel_err={eval_metrics['eval_rel_error_exact']:.8e}"
+                )
+
+            print(eval_msg)
+
             if cfg.wandb_mode != "disabled":
                 wandb.log(eval_metrics, step=it)
 
