@@ -27,24 +27,18 @@ class Args:
     jax_platform_name: str = "gpu"
     compute_exact_diag: bool = True
 
-    # Ising
-    # N: int = 12
-    # Gamma: float = -1.0
-    # V: float = -1.0
-
-    # Heisenberg chain
-    # N: int = 12
-    # J: float = 0.25
-    # pbc: bool = True
-    # sign_rule: bool = False
-
-    # J2/J1
+    hamiltonian: str = "ising"   # {"ising", "heisenberg", "j1j2"}
     N: int = 12
-    J1: float = 1.0
-    J2: float = 0.5
     pbc: bool = True
+    # TFIM
     Gamma: float = -1.0
     V: float = -1.0
+    # Heisenberg
+    J: float = 0.25
+    sign_rule: bool = False
+    # J1-J2
+    J1: float = 1.0
+    J2: float = 0.5
 
     # Sampling / AR
     n_samples: int = 1024
@@ -219,31 +213,19 @@ def main(cfg: Args) -> None:
             mode=cfg.wandb_mode,
         )
         
-    # hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
-    # graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+    hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
 
-    # H_nk = nk.operator.Heisenberg(
-    #     hi,
-    #     graph=graph,
-    #     J=cfg.J,
-    #     sign_rule=cfg.sign_rule,
-    # )   
-
-    # Match qps.py Hamiltonian
-    hi = nk.hilbert.Spin(s=0.5, N=cfg.N)
-    g = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
-
-    H_nk = nk.operator.Heisenberg(
-        hilbert=hi,
-        graph=g,
-        J=[cfg.J1, cfg.J2],
-        sign_rule=[False, False],
-    )
-
-    # hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
-    # graph = nk.graph.Chain(length=cfg.N, pbc=True)
-
-    # H_nk = nk.operator.Ising(hi, graph, h=-cfg.Gamma, J=cfg.V)
+    if cfg.hamiltonian == "ising":
+        graph = nk.graph.Chain(length=cfg.N, pbc=True)
+        H_nk = nk.operator.Ising(hi, graph, h=-cfg.Gamma, J=cfg.V)
+    elif cfg.hamiltonian == "heisenberg":
+        graph = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc)
+        H_nk = nk.operator.Heisenberg(hi, graph=graph, J=cfg.J, sign_rule=cfg.sign_rule)
+    elif cfg.hamiltonian == "j1j2":
+        g = nk.graph.Chain(length=cfg.N, pbc=cfg.pbc, max_neighbor_order=2)
+        H_nk = nk.operator.Heisenberg(hilbert=hi, graph=g, J=[cfg.J1, cfg.J2], sign_rule=[False, False])
+    else:
+        raise ValueError(f"Unknown hamiltonian: {cfg.hamiltonian!r}. Choose from 'ising', 'heisenberg', 'j1j2'.")
 
     E_gs_exact = None
     if cfg.compute_exact_diag:

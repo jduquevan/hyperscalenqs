@@ -1,3 +1,5 @@
 wandb/
 outputs/
+logs/
+.env
 *.pyc
