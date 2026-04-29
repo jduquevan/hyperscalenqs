@@ -4,7 +4,7 @@
 #       Job blueprint        #
 ##############################
 
-#SBATCH --job-name=qps_tfim
+#SBATCH --job-name=qps
 
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
@@ -16,7 +16,7 @@
 #SBATCH --time=0-02:10:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu-short
-#SBATCH --constraint=A100.80G
+#SBATCH --constraint=L4
 #SBATCH --cpus-per-task=8
 # Uncomment and set if your cluster requires an account:
 ##SBATCH --account=<YOUR_ACCOUNT>
@@ -34,19 +34,21 @@ mkdir -p "$HOME/slurm_logs" logs/
 
 # Arguments
 SEED=${SLURM_ARRAY_TASK_ID}
-HAMILTONIAN=${1:-ising}
-RUN_NAME=${2:-qps_${HAMILTONIAN}_seed_${SEED}_tiny}
+# Use 20k transition steps for Ising, 40k otherwise
+HAMILTONIAN=${1:-j1j2}
+RUN_NAME=${2:-qps_${HAMILTONIAN}_seed_${SEED}}
 
 CMD="python src/qps.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
+    transition_steps=$([ "$HAMILTONIAN" = "ising" ] && echo 20000 || echo 40000) \
     N=12 \
-    transition_steps=1000000 \
-    n_gru_layers=1 \
-    rnn_hidden=64 \
-    head_hidden=64 \
+    n_gru_layers=3 \
+    rnn_hidden=256 \
+    head_hidden=256 \
     wandb_run_name=${RUN_NAME} \
-    wandb_mode=online"
+    wandb_mode=online \
+    wandb_project=hyperscalenqs-l4"
 
 echo "Executing: $CMD"
 eval $CMD

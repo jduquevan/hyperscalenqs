@@ -4,7 +4,7 @@
 #       Job blueprint        #
 ##############################
 
-#SBATCH --job-name=minsr
+#SBATCH --job-name=adam
 
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
@@ -35,9 +35,9 @@ mkdir -p "$HOME/slurm_logs" logs/
 # Arguments
 SEED=${SLURM_ARRAY_TASK_ID}
 HAMILTONIAN=${1:-j1j2}
-RUN_NAME=${2:-minsr_${HAMILTONIAN}_seed_${SEED}}
+RUN_NAME=${2:-adam_${HAMILTONIAN}_seed_${SEED}}
 
-CMD="python src/minsr.py \
+CMD="python src/adam.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
     N=12 \

@@ -44,16 +44,14 @@ class Args:
     n_samples: int = 2048
     machine_pow: int = 2
 
-    # minSR / SR driver
+    # Adam driver
     n_iter: int = 1000000
     lr: float = 0.001
-    sr_diag_shift: float = 1e-2
-    use_ntk: bool = True          # True => minSR, False => standard SR
-    on_the_fly: bool = True       
-    chunk_size_bwd: Optional[int] = None
-    mode: str = "complex"         # complex wavefunction
+    adam_b1: float = 0.9
+    adam_b2: float = 0.999
+    adam_eps: float = 1e-8
 
-    # Architecture: match qps.py
+    # Architecture: match qps.py / minsr.py
     embed_dim: int = 32
     rnn_hidden: int = 256
     head_hidden: int = 256
@@ -72,9 +70,9 @@ class Args:
     eval_exact_chunk_size: Optional[int] = None
 
     # LR Scheduler
-    lr_peak: float = 3e-4          # peak LR
-    lr_div_factor: float = 10.0    # init = 2e-4
-    lr_final_div_factor: float = 100.0  # final = 2e-6
+    lr_peak: float = 3e-4
+    lr_div_factor: float = 10.0
+    lr_final_div_factor: float = 100.0
     lr_pct_start: float = 0.15
     transition_steps: int = 4000
 
@@ -95,21 +93,18 @@ class GRULayer(nn.Module):
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         B, T, _ = x.shape
+        carry0 = jnp.zeros((B, self.hidden_size), dtype=x.dtype)
 
-        cell = nn.GRUCell(
-            features=self.hidden_size,
-            param_dtype=self.param_dtype,
-            name="cell",
+        ScanGRU = nn.scan(
+            nn.GRUCell,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            in_axes=1,
+            out_axes=1,
         )
-
-        carry = jnp.zeros((B, self.hidden_size), dtype=x.dtype)
-
-        ys = []
-        for t in range(T):
-            carry, y = cell(carry, x[:, t, :])
-            ys.append(y)
-
-        return jnp.stack(ys, axis=1)
+        gru = ScanGRU(features=self.hidden_size, param_dtype=self.param_dtype)
+        _, h = gru(carry0, x)
+        return h
 
 
 class ComplexRecurrentAR(nk.models.AbstractARNN):
@@ -212,7 +207,7 @@ def main(cfg: Args) -> None:
             dir=cfg.wandb_directory,
             mode=cfg.wandb_mode,
         )
-        
+
     hi = nk.hilbert.Spin(s=1 / 2, N=cfg.N)
 
     if cfg.hamiltonian == "ising":
@@ -264,17 +259,17 @@ def main(cfg: Args) -> None:
         final_div_factor=cfg.lr_final_div_factor,
     )
 
-    # This is the key line: use_ntk=True => minSR
-    driver = nk.driver.VMC_SR(
+    optimizer = optax.adam(
+        learning_rate=lr_schedule,
+        b1=cfg.adam_b1,
+        b2=cfg.adam_b2,
+        eps=cfg.adam_eps,
+    )
+
+    driver = nk.driver.VMC(
         hamiltonian=H_nk,
-        optimizer=optax.sgd(cfg.lr),
+        optimizer=optimizer,
         variational_state=vstate,
-        diag_shift=cfg.sr_diag_shift,
-        use_ntk=cfg.use_ntk,
-        on_the_fly=cfg.on_the_fly,
-        chunk_size_bwd=cfg.chunk_size_bwd,
-        mode=cfg.mode,
-        momentum=0.8,
     )
 
     print("Number of parameters:", sum(x.size for x in jax.tree_util.tree_leaves(vstate.parameters)))
@@ -319,7 +314,6 @@ def main(cfg: Args) -> None:
                 stats = eval_vstate.expect(H_nk)
                 e = stats.mean
 
-                # crude chunked accumulation
                 cur_n = min(cfg.eval_batch_size, n_remaining)
                 er = float(jnp.real(e))
                 ei = float(jnp.imag(e))

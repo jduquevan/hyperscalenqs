@@ -54,7 +54,7 @@ class Args:
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
     # transition_steps: int = 100_000
-    transition_steps: int = 100000
+    transition_steps: int = 40000
     use_phase_jacobian_baseline: bool = True
     phase_jacobian_baseline_eps: float = 1e-8
 

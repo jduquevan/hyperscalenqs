@@ -4,19 +4,19 @@
 #       Job blueprint        #
 ##############################
 
-#SBATCH --job-name=minsr
+#SBATCH --job-name=qps_j1j2
 
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-#SBATCH --array=0-9
+#SBATCH --array=0-4
 
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --mem=32G
-#SBATCH --time=0-02:10:00
+#SBATCH --mem=40G
+#SBATCH --time=0-00:10:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu-short
-#SBATCH --constraint=L4
+#SBATCH --constraint=A100.80G
 #SBATCH --cpus-per-task=8
 # Uncomment and set if your cluster requires an account:
 ##SBATCH --account=<YOUR_ACCOUNT>
@@ -34,19 +34,19 @@ mkdir -p "$HOME/slurm_logs" logs/
 
 # Arguments
 SEED=${SLURM_ARRAY_TASK_ID}
-HAMILTONIAN=${1:-j1j2}
-RUN_NAME=${2:-minsr_${HAMILTONIAN}_seed_${SEED}}
+MODEL_TYPE=${1:-gru1d}         # "gru1d" or "gru2d"
+RUN_NAME=${2:-qps_square_j1j2_${MODEL_TYPE}_seed_${SEED}}
 
-CMD="python src/minsr.py \
+CMD="python src/qps_j1j2.py \
     seed=${SEED} \
-    hamiltonian=${HAMILTONIAN} \
-    N=12 \
-    n_gru_layers=3 \
-    rnn_hidden=256 \
-    head_hidden=256 \
+    L=10 \
+    model_type=${MODEL_TYPE} \
+    transition_steps=1000000 \
+    n_gru_layers=1 \
+    rnn_hidden=64 \
+    head_hidden=64 \
     wandb_run_name=${RUN_NAME} \
-    wandb_mode=online \
-    wandb_project=hyperscalenqs-l4"
+    wandb_mode=online"
 
 echo "Executing: $CMD"
 eval $CMD
