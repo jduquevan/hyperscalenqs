@@ -18,6 +18,8 @@ dependencies = [
   "transformers>=5.4.0",
   "torch>=2.11.0",
   "jupyter>=1.1.1",
+  "fire>=0.7.1",
+  "pandas>=3.0.2",
 ]
 
 [project.optional-dependencies]

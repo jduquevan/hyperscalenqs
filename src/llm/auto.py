@@ -44,7 +44,7 @@ models = {
     # "6w7B": (rwkv6, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-6-world", filename="RWKV-x060-World-7B-v2.1-20240507-ctx4096.pth")), None),
     # "6w14B": (rwkv6, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-6-world", filename="RWKV-x060-World-14B-v2.1-20240719-ctx4096.pth")), None),
 
-    "7w0.1B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-7-world", filename="RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth")), None),
+    "7w0.1B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-7-world", filename="RWKV-x070-World-rwkv7-g1d-0.1b-20260129-ctx8192.pth")), None),
     "7w0.4B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-7-world", filename="RWKV-x070-World-0.4B-v2.9-20250107-ctx4096.pth")), None),
     "7w1.5B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-7-world", filename="RWKV-x070-World-1.5B-v3-20250127-ctx4096.pth")), None),
     "7w3B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-7-world", filename="RWKV-x070-World-2.9B-v3-20250211-ctx4096.pth")), None),
@@ -53,7 +53,7 @@ models = {
     "7n0.4B": (rwkv7, GptTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-7-pile", filename="RWKV-x070-Pile-421M-20241127-ctx4096.pth")), None),
     "7n1.5B": (rwkv7, GptTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv-7-pile", filename="RWKV-x070-Pile-1.47B-20241210-ctx4096.pth")), None),
 
-    "7g0.1B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv7-g1", filename="rwkv7-g1-0.1b-20250307-ctx4096.pth")), None),
+    "7g0.1B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv7-g1", filename="rwkv7-g1d-0.1b-20260129-ctx8192.pth")), None),
     "7g0.4B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv7-g1", filename="rwkv7-g1-0.4b-20250324-ctx4096.pth")), None),
     "7g1.5B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv7-g1", filename="rwkv7-g1e-1.5b-20260309-ctx8192.pth")), None),
     "7g2.9B": (rwkv7, WorldTokenizer, (lambda : hf_hub_download(repo_id="BlinkDL/rwkv7-g1", filename="rwkv7-g1-2.9b-20250519-ctx4096.pth")), None),

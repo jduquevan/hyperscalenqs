@@ -9,6 +9,7 @@ from huggingface_hub.constants import HF_HOME
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
 os.environ.setdefault("JAX_PLATFORM_NAME", "gpu")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
 import jax
 import jax.numpy as jnp
@@ -57,24 +58,24 @@ class Args:
 
     # PPO / optimization
     n_iter: int = 1000000
-    batch_size: int = 64
+    batch_size: int = 900
     eval_n_samples: int = 4096
-    eval_batch_size: int = 128
+    eval_batch_size: int = 256
     eval_n_discard_per_chain: int = 0
     ppo_epochs: int = 4
     sampler_uses_variables_dict: bool = True
     normalize_advantage: bool = True
     ppo_clip_eps: float = 1e-3
     kl_coef: float = 0.0
-    lr: float = 1e-6
+    lr: float = 1e-5
     optimizer: str = "adam"
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
-    transition_steps: int = 8000
+    transition_steps: int = 2400
     machine_pow: int = 2
 
     # RWKV setup
-    model_choice: str = "7g1.5B"
+    model_choice: str = "7g0.1B"
     rwkv_type: str = "AssociativeScanRWKV"
     dtype: Optional[str] = None
     load_model: bool = False
@@ -87,7 +88,7 @@ class Args:
 
     # Logging / eval
     log_every: int = 10
-    eval_every: int = 200
+    eval_every: int = 50
     wandb_project: str = "hyperscalenqs"
     wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
@@ -245,8 +246,9 @@ class RWKVAutoregressiveNQS(nk.models.AbstractARNN):
         state0 = _RWKV_MODEL.default_state(params["rwkv"], _RWKV_CONFIG)
         h, _ = _rwkv_forward_features(params["rwkv"], prev_tokens, state0)   # (N, d_model)
 
-        W = params["nqs_head"]["W"]
-        b = params["nqs_head"]["b"]
+        h = h.astype(jnp.float32)
+        W = params["nqs_head"]["W"].astype(jnp.float32)
+        b = params["nqs_head"]["b"].astype(jnp.float32)
 
         two_logits = h @ W + b                      # (N, 2)
         log_cond = jax.nn.log_softmax(two_logits.astype(jnp.float32), axis=-1)
@@ -275,12 +277,26 @@ def make_tx(cfg: Args):
     #     staircase=True,
     # )
 
-    lr_schedule = optax.schedules.cosine_onecycle_schedule(
-        transition_steps=cfg.transition_steps,
-        peak_value=1e-5,
-        pct_start=0.15,
-        div_factor=10.0,
-        final_div_factor=100.0,
+    # lr_schedule = optax.schedules.cosine_onecycle_schedule(
+    #     transition_steps=cfg.transition_steps,
+    #     peak_value=3e-5,
+    #     pct_start=0.15,
+    #     div_factor=10.0,
+    #     final_div_factor=300.0,
+    # )
+
+    lr_schedule = optax.join_schedules(
+        schedules=[
+            optax.schedules.cosine_onecycle_schedule(
+                transition_steps=cfg.transition_steps,
+                peak_value=3e-5,
+                pct_start=0.15,
+                div_factor=10.0,
+                final_div_factor=300.0,
+            ),
+            optax.constant_schedule(0.0),
+        ],
+        boundaries=[cfg.transition_steps],
     )
 
     opt = cfg.optimizer.lower()
@@ -377,8 +393,8 @@ def main(cfg: Args) -> None:
     params0 = {
         "rwkv": rwkv_params,
         "nqs_head": {
-            "W": 0.02 * jax.random.normal(head_key, (d_model, 2), dtype=head_dtype),
-            "b": jnp.zeros((2,), dtype=head_dtype),
+            "W": 1e-4 * jax.random.normal(head_key, (d_model, 2), dtype=jnp.float32),
+            "b": jnp.zeros((2,), dtype=jnp.float32),
         },
     }
 

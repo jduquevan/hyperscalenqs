@@ -15,10 +15,10 @@
 #SBATCH -N 1 #nodes
 #SBATCH -n 1 #tasks
 #SBATCH --mem=40G
-#SBATCH --time=0-04:59:00
+#SBATCH --time=0-05:59:00
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --partition=long
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=6
 
 # Submit jobs.
 module purge
@@ -33,7 +33,7 @@ SEED=${1}
 ENV=${2}
 
 # Construct the full command
-CMD="python -m src.llm.rwkv7_qps"
+CMD="python -m src.llm.rwkv7_qps 'seed=${SEED}'"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"

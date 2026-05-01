@@ -28,7 +28,7 @@ class Args:
     compute_exact_diag: bool = True
 
     # Hamiltonian
-    hamiltonian: str = "ising"   # {"ising", "heisenberg", "j1j2"}
+    hamiltonian: str = "heisenberg"   # {"ising", "heisenberg", "j1j2"}
 
     N: int = 12
     pbc: bool = True
@@ -292,7 +292,7 @@ def main(cfg: Args) -> None:
         on_the_fly=cfg.on_the_fly,
         chunk_size_bwd=cfg.chunk_size_bwd,
         mode=cfg.mode,
-        momentum=0.8,
+        momentum=0.0,
     )
 
     print("Number of parameters:", sum(x.size for x in jax.tree_util.tree_leaves(vstate.parameters)))

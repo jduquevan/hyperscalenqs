@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import math
+import time
 
 import hydra
 import wandb
@@ -30,7 +31,7 @@ class Args:
     compute_exact_diag: bool = True
 
     # Hamiltonian
-    hamiltonian: str = "ising"   # {"ising", "heisenberg", "j1j2"}
+    hamiltonian: str = "j1j2"   # {"ising", "heisenberg", "j1j2"}
 
     N: int = 12
     pbc: bool = True
@@ -64,7 +65,7 @@ class Args:
     decay_rate: float = 0.5
     # transition_steps: int = 100_000
     transition_steps: int = 40000
-    use_phase_jacobian_baseline: bool = True
+    use_phase_jacobian_baseline: bool = False
     phase_jacobian_baseline_eps: float = 1e-8
 
     # PPO / clipped objectives
@@ -98,6 +99,9 @@ class Args:
     eval_n_discard_per_chain: int = 0
     eval_mode: str = "exact"   # {"sample", "exact"}
     eval_exact_chunk_size: Optional[int] = None
+
+    # Timing
+    time_optimization_steps: bool = False
 
     wandb_project: str = "hyperscalenqs"
     wandb_entity: Optional[str] = None
@@ -207,6 +211,7 @@ class GRULayer(nn.Module):
         _, h = gru(carry0, x)
         return h
 
+
 class ResidualMLPBlock(nn.Module):
     width: int
     residual_scale: float = 0.1
@@ -230,7 +235,6 @@ class ComplexRecurrentAR(nk.models.AbstractARNN):
     machine_pow: int = 2
     phase_scale: float = math.pi
     phase_init_std: float = 1e-3
-
 
     @nn.compact
     def conditionals_log_psi(self, inputs: jax.Array) -> jax.Array:
@@ -375,7 +379,7 @@ def main(cfg: Args) -> None:
 
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params0))
     print(f"Number of parameters: {n_params:,}")
-    
+
     sampler_state0 = vstate.sampler_state
     chain_length = vstate.chain_length
     N = cfg.N
@@ -408,7 +412,6 @@ def main(cfg: Args) -> None:
 
         batch = (configs_flat, old_logp, old_phase, e_loc)
         return batch, sampler_state
-
 
     def loss_terms_on_batch(params, batch):
         configs_flat, old_logp, old_phase, e_loc = batch
@@ -578,10 +581,9 @@ def main(cfg: Args) -> None:
 
         else:
             raise ValueError(f"Unknown phase_loss_type: {cfg.phase_loss_type}")
-        
+
         w = w.astype(new_phase.dtype)
         return jax.lax.stop_gradient(w)
-
 
     def phase_linearized_objective(params, batch, weights):
         """
@@ -593,7 +595,6 @@ def main(cfg: Args) -> None:
         new_phase = jnp.imag(new_logpsi)
         weights = jax.lax.stop_gradient(weights)
         return jnp.sum(weights * new_phase)
-
 
     def apply_phase_jacobian_baseline(params, batch, grads_imag):
         """
@@ -778,7 +779,6 @@ def main(cfg: Args) -> None:
         metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics_hist)
         return state, sampler_state, metrics, batch
 
-    
     def real_objective(params, batch):
         losses, _ = loss_terms_on_batch(params, batch)
         return losses["real"]
@@ -790,13 +790,47 @@ def main(cfg: Args) -> None:
         w = phase_backward_weights(params, batch)
         return phase_linearized_objective(params, batch, w)
 
-
     sampler_state = sampler_state0
+
+    timing_last_wall = None
+    timing_last_iter = None
+    timing_total_elapsed = 0.0
+    timing_total_outer_steps = 0
+
+    time_per_outer_iter = float("nan")
+    time_per_inner_ppo_step = float("nan")
+    time_per_outer_iter_recent = float("nan")
+    time_per_inner_ppo_step_recent = float("nan")
 
     for it in range(cfg.n_iter):
         state, sampler_state, metrics, batch = train_iter(state, sampler_state)
 
         if it % cfg.log_every == 0:
+            if cfg.time_optimization_steps:
+                # Force async GPU work to finish before reading wall-clock time.
+                jax.block_until_ready(metrics["loss"])
+                now = time.perf_counter()
+
+                if timing_last_wall is not None and timing_last_iter is not None:
+                    elapsed = now - timing_last_wall
+                    outer_steps = max(it - timing_last_iter, 1)
+                    inner_steps = max(outer_steps * cfg.ppo_epochs, 1)
+
+                    timing_total_elapsed += elapsed
+                    timing_total_outer_steps += outer_steps
+
+                    time_per_outer_iter_recent = elapsed / outer_steps
+                    time_per_inner_ppo_step_recent = elapsed / inner_steps
+
+                    time_per_outer_iter = timing_total_elapsed / max(timing_total_outer_steps, 1)
+                    time_per_inner_ppo_step = timing_total_elapsed / max(
+                        timing_total_outer_steps * cfg.ppo_epochs,
+                        1,
+                    )
+
+                timing_last_wall = now
+                timing_last_iter = it
+
             current_lr = float(lr_schedule(state.step))
             msg = (
                 f"it={it:04d}  loss={float(metrics['loss']): .6f}  "
@@ -816,6 +850,15 @@ def main(cfg: Args) -> None:
                     f"  E_exact={float(metrics['E_exact']): .6f}"
                     f"  rel_err_batch={float(metrics['rel_error_exact']): .3e}"
                 )
+
+            if cfg.time_optimization_steps:
+                msg += (
+                    f"  t/outer={time_per_outer_iter: .4f}s"
+                    f"  t/ppo={time_per_inner_ppo_step: .4f}s"
+                    f"  t/outer_recent={time_per_outer_iter_recent: .4f}s"
+                    f"  t/ppo_recent={time_per_inner_ppo_step_recent: .4f}s"
+                )
+
             print(msg)
 
             if cfg.wandb_mode != "disabled":
@@ -841,6 +884,15 @@ def main(cfg: Args) -> None:
                     "phase_stat_mean": float(metrics["phase_stat_mean"]),
                     "phase_stat_abs_mean": float(metrics["phase_stat_abs_mean"]),
                 }
+
+                if cfg.time_optimization_steps:
+                    log_dict.update({
+                        "time_per_outer_iter": time_per_outer_iter,
+                        "time_per_inner_ppo_step": time_per_inner_ppo_step,
+                        "time_per_outer_iter_recent": time_per_outer_iter_recent,
+                        "time_per_inner_ppo_step_recent": time_per_inner_ppo_step_recent,
+                    })
+
                 if E_gs_exact is not None:
                     log_dict["E_exact"] = float(metrics["E_exact"])
                     log_dict["rel_error_exact"] = float(metrics["rel_error_exact"])

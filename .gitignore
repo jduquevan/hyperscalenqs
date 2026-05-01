@@ -1,3 +1,5 @@
 wandb/
 outputs/
 *.pyc
+notebooks/
+*.pdf
