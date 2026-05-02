@@ -13,10 +13,10 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH --mem=40G
-#SBATCH --time=0-02:10:00
+#SBATCH --time=0-04:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu-short
-#SBATCH --constraint=L4
+#SBATCH --constraint=A100.80G
 #SBATCH --cpus-per-task=8
 # Uncomment and set if your cluster requires an account:
 ##SBATCH --account=<YOUR_ACCOUNT>
@@ -48,7 +48,7 @@ CMD="python src/qps.py \
     head_hidden=256 \
     wandb_run_name=${RUN_NAME} \
     wandb_mode=online \
-    wandb_project=hyperscalenqs-l4"
+    wandb_project=hyperscalenqs-scaling"
 
 echo "Executing: $CMD"
 eval $CMD
