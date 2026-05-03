@@ -58,9 +58,9 @@ class Args:
 
     # PPO / optimization
     n_iter: int = 1000000
-    batch_size: int = 900
+    batch_size: int = 150
     eval_n_samples: int = 4096
-    eval_batch_size: int = 256
+    eval_batch_size: int = 128
     eval_n_discard_per_chain: int = 0
     ppo_epochs: int = 4
     sampler_uses_variables_dict: bool = True
@@ -71,11 +71,11 @@ class Args:
     optimizer: str = "adam"
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
-    transition_steps: int = 2400
+    transition_steps: int = 4800
     machine_pow: int = 2
 
     # RWKV setup
-    model_choice: str = "7g0.1B"
+    model_choice: str = "7g1.5B"
     rwkv_type: str = "AssociativeScanRWKV"
     dtype: Optional[str] = None
     load_model: bool = False
@@ -88,7 +88,7 @@ class Args:
 
     # Logging / eval
     log_every: int = 10
-    eval_every: int = 50
+    eval_every: int = 100
     wandb_project: str = "hyperscalenqs"
     wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
@@ -277,27 +277,27 @@ def make_tx(cfg: Args):
     #     staircase=True,
     # )
 
-    # lr_schedule = optax.schedules.cosine_onecycle_schedule(
-    #     transition_steps=cfg.transition_steps,
-    #     peak_value=3e-5,
-    #     pct_start=0.15,
-    #     div_factor=10.0,
-    #     final_div_factor=300.0,
-    # )
-
-    lr_schedule = optax.join_schedules(
-        schedules=[
-            optax.schedules.cosine_onecycle_schedule(
-                transition_steps=cfg.transition_steps,
-                peak_value=3e-5,
-                pct_start=0.15,
-                div_factor=10.0,
-                final_div_factor=300.0,
-            ),
-            optax.constant_schedule(0.0),
-        ],
-        boundaries=[cfg.transition_steps],
+    lr_schedule = optax.schedules.cosine_onecycle_schedule(
+        transition_steps=cfg.transition_steps,
+        peak_value=2e-5,
+        pct_start=0.15,
+        div_factor=10.0,
+        final_div_factor=300.0,
     )
+
+    # lr_schedule = optax.join_schedules(
+    #     schedules=[
+    #         optax.schedules.cosine_onecycle_schedule(
+    #             transition_steps=cfg.transition_steps,
+    #             peak_value=3e-5,
+    #             pct_start=0.15,
+    #             div_factor=10.0,
+    #             final_div_factor=300.0,
+    #         ),
+    #         optax.constant_schedule(0.0),
+    #     ],
+    #     boundaries=[cfg.transition_steps],
+    # )
 
     opt = cfg.optimizer.lower()
     if opt == "sgd":
