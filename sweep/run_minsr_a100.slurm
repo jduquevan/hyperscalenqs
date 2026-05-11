@@ -33,20 +33,34 @@ set -a; [ -f "$SLURM_SUBMIT_DIR/.env" ] && source "$SLURM_SUBMIT_DIR/.env"; set 
 mkdir -p "$HOME/slurm_logs" logs/
 
 # Arguments
+# Usage: sbatch run_minsr_a100.slurm <hamiltonian> <method>
+#   hamiltonian: ising | heisenberg | j1j2  (default: ising)
+#   method:      minsr | spring              (default: minsr)
 SEED=${SLURM_ARRAY_TASK_ID}
-HAMILTONIAN=${1:-j1j2}
-RUN_NAME=${2:-minsr_${HAMILTONIAN}_seed_${SEED}}
+HAMILTONIAN=${1:-ising}
+METHOD=${2:-minsr}
+
+# SPRING uses momentum=0.8; minSR uses momentum=0.0
+MOMENTUM=$([ "$METHOD" = "spring" ] && echo 0.8 || echo 0.0)
+
+# Constant LR: 1e-2 for Ising, 1e-3 for Heisenberg and J1-J2
+LR=$([ "$HAMILTONIAN" = "ising" ] && echo 1e-2 || echo 1e-3)
+
+RUN_NAME=${METHOD}_${HAMILTONIAN}_seed_${SEED}
 
 CMD="python src/minsr.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
+    n_samples=1024 \
+    lr=${LR} \
+    sr_momentum=${MOMENTUM} \
     N=12 \
     n_gru_layers=3 \
     rnn_hidden=256 \
     head_hidden=256 \
     wandb_run_name=${RUN_NAME} \
     wandb_mode=online \
-    wandb_project=hyperscalenqs-scaling"
+    wandb_project=hyperscalenqs"
 
 echo "Executing: $CMD"
 eval $CMD

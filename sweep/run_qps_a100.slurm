@@ -34,21 +34,22 @@ mkdir -p "$HOME/slurm_logs" logs/
 
 # Arguments
 SEED=${SLURM_ARRAY_TASK_ID}
-# Use 20k transition steps for Ising, 40k otherwise
-HAMILTONIAN=${1:-j1j2}
+HAMILTONIAN=${1:-ising}
 RUN_NAME=${2:-qps_${HAMILTONIAN}_seed_${SEED}}
 
 CMD="python src/qps.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
+    n_samples=1024 \
     transition_steps=$([ "$HAMILTONIAN" = "ising" ] && echo 20000 || echo 40000) \
+    lr_peak=1e-4 \
     N=12 \
     n_gru_layers=3 \
     rnn_hidden=256 \
     head_hidden=256 \
     wandb_run_name=${RUN_NAME} \
     wandb_mode=online \
-    wandb_project=hyperscalenqs-scaling"
+    wandb_project=hyperscalenqs"
 
 echo "Executing: $CMD"
 eval $CMD

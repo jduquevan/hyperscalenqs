@@ -49,9 +49,10 @@ class Args:
     lr: float = 0.001
     sr_diag_shift: float = 1e-2
     use_ntk: bool = True          # True => minSR, False => standard SR
-    on_the_fly: bool = True       
+    on_the_fly: bool = True
     chunk_size_bwd: Optional[int] = None
     mode: str = "complex"         # complex wavefunction
+    sr_momentum: float = 0.0      # 0.0 => minSR, 0.8 => SPRING
 
     # Architecture: match qps.py
     embed_dim: int = 32
@@ -274,7 +275,7 @@ def main(cfg: Args) -> None:
         on_the_fly=cfg.on_the_fly,
         chunk_size_bwd=cfg.chunk_size_bwd,
         mode=cfg.mode,
-        momentum=0.8,
+        momentum=cfg.sr_momentum,
     )
 
     print("Number of parameters:", sum(x.size for x in jax.tree_util.tree_leaves(vstate.parameters)))
@@ -300,9 +301,13 @@ def main(cfg: Args) -> None:
             energy = exact_stats.mean
             e_real = float(jnp.real(energy))
             e_imag = float(jnp.imag(energy))
+            var_real = float(jnp.real(exact_stats.variance))
+            denom = max(e_real * e_real, 1e-12)
             out = {
                 "eval_E_mean_real": e_real,
                 "eval_E_mean_imag": e_imag,
+                "eval_E_var_real": var_real,
+                "eval_V_score": float(cfg.N * var_real / denom),
             }
         else:
             eval_vstate.parameters = vstate.parameters

@@ -34,20 +34,23 @@ mkdir -p "$HOME/slurm_logs" logs/
 
 # Arguments
 SEED=${SLURM_ARRAY_TASK_ID}
-HAMILTONIAN=${1:-j1j2}
+HAMILTONIAN=${1:-ising}
 RUN_NAME=${2:-adam_${HAMILTONIAN}_seed_${SEED}}
 
 CMD="python src/adam.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
-    transition_steps=$([ "$HAMILTONIAN" = "ising" ] && echo 20000 || echo 40000) \
+    n_samples=1024 \
+    transition_steps=$([ "$HAMILTONIAN" = "ising" ] && echo 5000 || echo 10000) \
+    lr_peak=$([ "$HAMILTONIAN" = "ising" ] && echo 1e-4 || echo 3e-4) \
+    lr_div_factor=$([ "$HAMILTONIAN" = "ising" ] && echo 10.0 || echo 30.0) \
     N=12 \
     n_gru_layers=3 \
     rnn_hidden=256 \
     head_hidden=256 \
     wandb_run_name=${RUN_NAME} \
     wandb_mode=online \
-    wandb_project=hyperscalenqs-scaling"
+    wandb_project=hyperscalenqs"
 
 echo "Executing: $CMD"
 eval $CMD

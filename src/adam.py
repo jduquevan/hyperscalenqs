@@ -295,9 +295,13 @@ def main(cfg: Args) -> None:
             energy = exact_stats.mean
             e_real = float(jnp.real(energy))
             e_imag = float(jnp.imag(energy))
+            var_real = float(jnp.real(exact_stats.variance))
+            denom = max(e_real * e_real, 1e-12)
             out = {
                 "eval_E_mean_real": e_real,
                 "eval_E_mean_imag": e_imag,
+                "eval_E_var_real": var_real,
+                "eval_V_score": float(cfg.N * var_real / denom),
             }
         else:
             eval_vstate.parameters = vstate.parameters

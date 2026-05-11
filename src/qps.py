@@ -53,10 +53,15 @@ class Args:
     optimizer: str = "adam"
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
-    # transition_steps: int = 100_000
     transition_steps: int = 40000
     use_phase_jacobian_baseline: bool = True
     phase_jacobian_baseline_eps: float = 1e-8
+
+    # LR schedule
+    lr_peak: float = 1e-4
+    lr_div_factor: float = 10.0         # init_lr = lr_peak / lr_div_factor
+    lr_final_div_factor: float = 200.0  # final_lr = init_lr / lr_final_div_factor
+    lr_pct_start: float = 0.15
 
     # PPO / clipped objectives
     ppo_epochs: int = 4
@@ -132,12 +137,15 @@ def make_tx(cfg: Args):
     #     end_value=cfg.final_lr,
     # )
 
+    # Scale transition_steps by ppo_epochs so the schedule evolves on
+    # the outer-iteration timescale (as stated in the paper appendix).
+    schedule_steps = cfg.transition_steps * cfg.ppo_epochs
     lr_schedule = optax.schedules.cosine_onecycle_schedule(
-        transition_steps=cfg.transition_steps,
-        peak_value=1e-4,      # start modestly
-        pct_start=0.15,
-        div_factor=10.0,      # init = 1e-5
-        final_div_factor=200.0,  # final = 1e-8
+        transition_steps=schedule_steps,
+        peak_value=cfg.lr_peak,
+        pct_start=cfg.lr_pct_start,
+        div_factor=cfg.lr_div_factor,
+        final_div_factor=cfg.lr_final_div_factor,
     )
 
     opt = cfg.optimizer.lower()
@@ -622,7 +630,12 @@ def main(cfg: Args) -> None:
 
             energy_real = float(jnp.real(energy))
             energy_imag = float(jnp.imag(energy))
-            extra_metrics = {}
+            var_real = float(jnp.real(exact_stats.variance))
+            denom = max(energy_real * energy_real, 1e-12)
+            extra_metrics = {
+                "eval_E_var_real": var_real,
+                "eval_V_score": float(cfg.N * var_real / denom),
+            }
 
         elif cfg.eval_mode == "sample":
             eval_vstate.parameters = state.params
