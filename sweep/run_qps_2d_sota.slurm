@@ -11,7 +11,7 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH --mem=40G
-#SBATCH --time=0-06:59:00
+#SBATCH --time=0-01:59:00
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --partition=long
 #SBATCH --cpus-per-task=6
@@ -29,16 +29,11 @@ source .venv/bin/activate
 
 SEED=${1:-42}
 CONN_CHUNK_SIZE=${2:-8}
-N_SAMPLES=${3:-512}
-PPO_EPOCHS=${4:-2}
+N_SAMPLES=${3:-2048}
+PPO_EPOCHS=${4:-4}
 WANDB_MODE=${5:-online}
 
-CMD="python -m src.2d.qps_j1j2_square_kv_cache \
-  seed=${SEED} \
-  local_energy_conn_chunk_size=${CONN_CHUNK_SIZE} \
-  n_samples=${N_SAMPLES} \
-  ppo_epochs=${PPO_EPOCHS} \
-  wandb_mode=${WANDB_MODE}"
+CMD="python -m src.2d.eval_hf_j1j2_square_sota"
 
 stdbuf -o0 echo "Executing command: $CMD"
 

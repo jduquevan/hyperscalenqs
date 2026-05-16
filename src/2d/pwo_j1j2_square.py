@@ -24,8 +24,11 @@ import optax
 import orbax.checkpoint as ocp
 from flax.training import train_state
 
-from .ar_vit_rope_2d_cached import (
+from .vit_rope import (
+    ComplexPatchRoPETransformer2DAR,
     ComplexRoPETransformer2DAR,
+    configs_to_patch_tokens,
+    magnetization_to_targets,
     sample_cached_apply,
 )
 
@@ -39,29 +42,52 @@ class Args:
     pbc: bool = True
     J1: float = 1.0
     J2: float = 0.5
-    total_sz: int = 0
+    total_sz: float = 0.0
+    enforce_zero_magnetization: bool = True
 
-    n_samples: int = 2048
+    n_samples: int = 1024
     machine_pow: int = 2
 
-    width: int = 128
-    depth: int = 4
-    num_heads: int = 4
+    use_patch_ar: bool = True
+    patch_size: int = 2
+    use_input_tanh: bool = False
+
+    use_prefix_features: bool = True
+    prefix_feature_dim: int = 16
+
+    width: int = 96
+    depth: int = 8
+    num_heads: int = 6
     embed_dim: int = 64
     mlp_dim: Optional[int] = None
-    head_hidden: int = 128
+    head_hidden: int = 192
     use_site_embedding: bool = True
-    rope_base: float = 10_000.0
+    # 100 is usually a better starting point than the LLM default 10_000 for a 5x5
+    # patch lattice / 10x10 spin lattice.
+    rope_base: float = 100.0
     dropout: float = 0.0
     residual_scale: float = 1.0
     phase_scale: float = math.pi
     phase_init_std: float = 1e-3
 
-    peak_lr: float = 3e-4
+    # Learning-rate schedule.
+    #
+    # Supported values:
+    #   - "warmup_const_decay" (default): warm up, hold, then drop once.
+    #   - "constant": fixed LR = peak_lr.
+    #   - "cosine_onecycle" / "onecycle" / "cosine": original Optax one-cycle schedule.
+    #   - "cosine_decay": warmup followed by cosine decay from peak_lr to end_lr.
+    lr_schedule_type: str = "constant"
+    peak_lr: float = 0.0001
+    warmup_outer_steps: int = 25
+    decay_start_outer_steps: int = 300
+    decay_factor: float = 0.3
+    end_lr: float = 1e-6
+
     pct_start: float = 0.15
     div_factor: float = 10.0
     final_div_factor: float = 200.0
-    transition_steps: int = 5_000
+    transition_steps: int = 10_000
     n_iter: int = 1_000_000
     optimizer: str = "adam"
     sgd_momentum: float = 0.0
@@ -82,10 +108,10 @@ class Args:
     use_phase_jacobian_baseline: bool = False
     phase_jacobian_baseline_eps: float = 1e-8
 
-    eval_every: int = 200
-    eval_n_samples: int = 2028
+    eval_every: int = 300
+    eval_n_samples: int = 32768
     # eval_n_samples: int = 262_144
-    eval_batch_size: int = 2048
+    eval_batch_size: int = 1024
     reference_energy: Optional[float] = None
 
     local_energy_conn_chunk_size: int = 16
@@ -106,7 +132,7 @@ class Args:
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
     wandb_directory: Optional[str] = "."
-    wandb_tags: Optional[str] = "qps,j1j2_square,ar_vit_rope_2d,kv_cache"
+    wandb_tags: Optional[str] = "pwo,j1j2_square,patch_ar_2x2,rope_2d,kv_cache,zero_magnetization,prefix_stats"
 
 
 ConfigStore.instance().store(name="config", node=Args)
@@ -139,14 +165,73 @@ def cache_dtype_from_string(name: str):
     raise ValueError(f"Unknown kv_cache_dtype={name}")
 
 
+def make_warmup_const_decay_schedule(
+    *,
+    peak_lr: float,
+    warmup_steps: int,
+    decay_start_steps: int,
+    decay_factor: float,
+):
+    warmup_steps = max(int(warmup_steps), 0)
+    decay_start_steps = max(int(decay_start_steps), warmup_steps)
+    decay_factor = float(decay_factor)
+
+    def schedule(step):
+        step = jnp.asarray(step)
+        peak = jnp.asarray(peak_lr, dtype=jnp.float32)
+        if warmup_steps > 0:
+            warmup = peak * (step + 1) / float(warmup_steps)
+            lr = jnp.where(step < warmup_steps, warmup, peak)
+        else:
+            lr = peak
+        decayed = peak * decay_factor
+        lr = jnp.where(step >= decay_start_steps, decayed, lr)
+        return lr
+
+    return schedule
+
+
 def make_tx(cfg: Args):
-    lr_schedule = optax.schedules.cosine_onecycle_schedule(
-        transition_steps=cfg.transition_steps,
-        peak_value=cfg.peak_lr,
-        pct_start=cfg.pct_start,
-        div_factor=cfg.div_factor,
-        final_div_factor=cfg.final_div_factor,
-    )
+    schedule_type = cfg.lr_schedule_type.lower()
+
+    warmup_steps = int(cfg.warmup_outer_steps) * int(cfg.ppo_epochs)
+    decay_start_steps = int(cfg.decay_start_outer_steps) * int(cfg.ppo_epochs)
+
+    if schedule_type == "warmup_const_decay":
+        lr_schedule = make_warmup_const_decay_schedule(
+            peak_lr=cfg.peak_lr,
+            warmup_steps=warmup_steps,
+            decay_start_steps=decay_start_steps,
+            decay_factor=cfg.decay_factor,
+        )
+
+    elif schedule_type == "constant":
+        lr_schedule = optax.constant_schedule(cfg.peak_lr)
+
+    elif schedule_type in {"cosine", "cosine_onecycle", "onecycle"}:
+        lr_schedule = optax.schedules.cosine_onecycle_schedule(
+            transition_steps=cfg.transition_steps,
+            peak_value=cfg.peak_lr,
+            pct_start=cfg.pct_start,
+            div_factor=cfg.div_factor,
+            final_div_factor=cfg.final_div_factor,
+        )
+
+    elif schedule_type == "cosine_decay":
+        init_value = cfg.peak_lr / cfg.div_factor
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=init_value,
+            peak_value=cfg.peak_lr,
+            warmup_steps=warmup_steps,
+            decay_steps=cfg.transition_steps,
+            end_value=cfg.end_lr,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown lr_schedule_type={cfg.lr_schedule_type}. "
+            "Choose one of: warmup_const_decay, constant, cosine_onecycle, cosine_decay."
+        )
 
     opt = cfg.optimizer.lower()
     if opt == "adam":
@@ -159,9 +244,63 @@ def make_tx(cfg: Args):
     return tx, lr_schedule
 
 
+def target_magnetization_from_total_sz(total_sz: float) -> int:
+    """Converts NetKet total_sz=sum_i S_i^z to M=sum_i s_i for s_i in {-1,+1}."""
+    target = 2.0 * float(total_sz)
+    rounded = int(round(target))
+    if abs(target - rounded) > 1e-6:
+        raise ValueError(
+            f"total_sz={total_sz} gives non-integer target magnetization {target}."
+        )
+    return rounded
+
+
+def log_num_fixed_magnetization_configs(n_sites: int, target_magnetization: int) -> float:
+    """Returns log of the number of spin configurations with sum_i s_i = target_magnetization."""
+    if abs(target_magnetization) > n_sites:
+        raise ValueError(
+            f"target_magnetization={target_magnetization} is outside [-N, N] for N={n_sites}."
+        )
+    if (n_sites + target_magnetization) % 2 != 0:
+        raise ValueError(
+            f"target_magnetization={target_magnetization} has incompatible parity for N={n_sites}."
+        )
+    target_up = (n_sites + target_magnetization) // 2
+    target_down = n_sites - target_up
+    return (
+        math.lgamma(n_sites + 1)
+        - math.lgamma(target_up + 1)
+        - math.lgamma(target_down + 1)
+    )
+
+
+def max_entropy_for_hilbert(n_sites: int, target_magnetization: int, enforce_fixed_magnetization: bool) -> float:
+    """Maximum entropy of the sampling support in nats."""
+    if enforce_fixed_magnetization:
+        return log_num_fixed_magnetization_configs(n_sites, target_magnetization)
+    return n_sites * math.log(2.0)
+
+
+def make_fixed_magnetization_configs(
+    batch_size: int,
+    n_sites: int,
+    target_magnetization: int = 0,
+) -> jax.Array:
+    """Creates simple valid spin configurations with fixed M=sum_i s_i."""
+    target_down, target_up = magnetization_to_targets(n_sites, target_magnetization)
+    one = jnp.concatenate([
+        -jnp.ones((target_down,), dtype=jnp.int32),
+        jnp.ones((target_up,), dtype=jnp.int32),
+    ])
+    return jnp.broadcast_to(one[None, :], (batch_size, n_sites))
+
+
 def build_square_j1j2(cfg: Args):
     n_sites = cfg.L * cfg.L
-    hi = nk.hilbert.Spin(s=1 / 2, N=n_sites)
+    if cfg.enforce_zero_magnetization:
+        hi = nk.hilbert.Spin(s=1 / 2, N=n_sites, total_sz=cfg.total_sz)
+    else:
+        hi = nk.hilbert.Spin(s=1 / 2, N=n_sites)
     graph = nk.graph.Hypercube(
         length=cfg.L,
         n_dim=2,
@@ -178,7 +317,7 @@ def build_square_j1j2(cfg: Args):
 
 
 def make_model(cfg: Args, hilbert):
-    return ComplexRoPETransformer2DAR(
+    common_kwargs = dict(
         hilbert=hilbert,
         lattice_shape=(cfg.L, cfg.L),
         embed_dim=cfg.embed_dim,
@@ -194,8 +333,60 @@ def make_model(cfg: Args, hilbert):
         machine_pow=cfg.machine_pow,
         phase_scale=cfg.phase_scale,
         phase_init_std=cfg.phase_init_std,
+        enforce_zero_magnetization=cfg.enforce_zero_magnetization,
+        target_magnetization=target_magnetization_from_total_sz(cfg.total_sz),
+        use_prefix_features=cfg.use_prefix_features,
+        prefix_feature_dim=cfg.prefix_feature_dim,
+    )
+    if cfg.use_patch_ar:
+        return ComplexPatchRoPETransformer2DAR(
+            **common_kwargs,
+            patch_size=cfg.patch_size,
+            use_input_tanh=cfg.use_input_tanh,
+        )
+    return ComplexRoPETransformer2DAR(**common_kwargs)
+
+
+
+
+def apply_logpsi_explicit(model, params, configs):
+    """Evaluate log psi by explicitly gathering the selected AR token log-psi.
+
+    For the original site AR model this gathers one binary token per spin. For
+    v2 patch AR, the physical spin configuration is first converted into patch
+    tokens and then one categorical token is gathered per patch. In both cases
+    the returned value is log psi for the physical spin configuration.
+    """
+    if configs.ndim == 1:
+        configs = configs[None, :]
+    configs = configs.astype(jnp.int32)
+    cond_logpsi = model.apply(
+        {"params": params},
+        configs,
+        train=False,
+        method=model.conditionals_log_psi,
     )
 
+    if bool(getattr(model, "is_patch_ar", False)):
+        patch_tokens = configs_to_patch_tokens(
+            configs,
+            lattice_shape=model.lattice_shape,
+            patch_size=model.patch_size,
+        )
+        selected = jnp.take_along_axis(
+            cond_logpsi,
+            patch_tokens[..., None],
+            axis=-1,
+        )[..., 0]
+        return jnp.sum(selected, axis=-1)
+
+    spin_tokens = (configs > 0).astype(jnp.int32)
+    selected = jnp.take_along_axis(
+        cond_logpsi,
+        spin_tokens[..., None],
+        axis=-1,
+    )[..., 0]
+    return jnp.sum(selected, axis=-1)
 
 def make_local_energy_fn(
     model,
@@ -205,22 +396,84 @@ def make_local_energy_fn(
     debug_progress: bool = False,
     debug_print_every_chunks: int = 1,
 ):
+    """
+    Local energy with aggressive NaN diagnostics for fixed-magnetization masked AR models.
+
+    Important details:
+      * Padded zero-matrix-element connected states are never scored by the model.
+        They are replaced by the original valid configuration before model.apply.
+      * Ratio computation is masked before exp, so zero-mel entries cannot create 0 * NaN.
+      * Debug prints are intentionally labelled [LE ...] so you can verify this file is running.
+    """
     if conn_chunk_size < 1:
         raise ValueError("conn_chunk_size must be >= 1")
     if debug_print_every_chunks < 1:
         raise ValueError("debug_print_every_chunks must be >= 1")
 
+    target_magnetization = int(getattr(model, "target_magnetization", 0))
+    enforce_fixed_magnetization = bool(
+        getattr(model, "enforce_zero_magnetization", False)
+    )
+
     def local_energy(params, configs):
         configs = configs.astype(jnp.int32)
 
         x_primes, mels = H.get_conn_padded(configs)
-        logpsi_x = model.apply({"params": params}, configs)
+        logpsi_x = apply_logpsi_explicit(model, params, configs)
 
         compute_dtype = logpsi_x.dtype
         mels = mels.astype(compute_dtype)
 
         B, K, N = x_primes.shape
         C = conn_chunk_size
+
+        if debug_progress:
+            mag_configs = jnp.sum(configs, axis=-1)
+            target = jnp.asarray(target_magnetization, dtype=mag_configs.dtype)
+            jax.debug.print(
+                "[LE input] B={} K={} N={} C={} target_M={} enforce_fixed_M={} "
+                "configs_finite={} logpsi_x_finite={} "
+                "M_min={} M_max={} mean_abs_Merr={:.6e}",
+                B,
+                K,
+                N,
+                C,
+                target_magnetization,
+                enforce_fixed_magnetization,
+                jnp.all(jnp.isfinite(configs)),
+                jnp.all(jnp.isfinite(logpsi_x)),
+                jnp.min(mag_configs),
+                jnp.max(mag_configs),
+                jnp.mean(jnp.abs(mag_configs - target)),
+                ordered=True,
+            )
+            jax.debug.print(
+                "[LE logpsi_x] finite={} nan_count={} "
+                "real_min={:.6e} real_max={:.6e} imag_min={:.6e} imag_max={:.6e}",
+                jnp.all(jnp.isfinite(logpsi_x)),
+                jnp.sum(jnp.isnan(jnp.real(logpsi_x)))
+                + jnp.sum(jnp.isnan(jnp.imag(logpsi_x))),
+                jnp.nanmin(jnp.real(logpsi_x)),
+                jnp.nanmax(jnp.real(logpsi_x)),
+                jnp.nanmin(jnp.imag(logpsi_x)),
+                jnp.nanmax(jnp.imag(logpsi_x)),
+                ordered=True,
+            )
+
+            xprime_mag = jnp.sum(x_primes, axis=-1)
+            nonzero_conn = mels != 0
+            target = jnp.asarray(target_magnetization, dtype=xprime_mag.dtype)
+            jax.debug.print(
+                "[LE conn] x_primes_finite={} mels_finite={} nonzero_mels={} "
+                "xprime_M_min={} xprime_M_max={} bad_nonzero_target_M={}",
+                jnp.all(jnp.isfinite(x_primes)),
+                jnp.all(jnp.isfinite(mels)),
+                jnp.sum(nonzero_conn),
+                jnp.min(xprime_mag),
+                jnp.max(xprime_mag),
+                jnp.sum(nonzero_conn & (xprime_mag != target)),
+                ordered=True,
+            )
 
         pad_k = (-K) % C
         if pad_k > 0:
@@ -260,13 +513,66 @@ def make_local_energy_fn(
 
         def scan_chunk(e_acc, xs):
             chunk_idx, x_chunk, mel_chunk = xs
-            x_flat = x_chunk.reshape(B * C, N)
 
-            logpsi_xp = model.apply({"params": params}, x_flat)
+            x_flat = x_chunk.reshape(B * C, N)
+            mel_flat = mel_chunk.reshape(B * C)
+            nonzero_flat = mel_flat != 0
+
+            # Do not evaluate padded zero-mel states under the masked AR model.
+            # Some padded states can be impossible under the fixed-M constraint.
+            # Replacing them by the original valid config prevents logpsi NaNs from
+            # irrelevant zero-mel entries.
+            x_ref_flat = jnp.repeat(configs[:, None, :], C, axis=1).reshape(B * C, N)
+            x_flat_safe = jnp.where(nonzero_flat[:, None], x_flat, x_ref_flat)
+
+            if debug_progress:
+                should_print_pre = (chunk_idx % debug_print_every_chunks == 0) | (
+                    chunk_idx == n_chunks - 1
+                )
+
+                def do_pre_print(_):
+                    mag_flat = jnp.sum(x_flat, axis=-1)
+                    mag_safe = jnp.sum(x_flat_safe, axis=-1)
+                    target = jnp.asarray(target_magnetization, dtype=mag_flat.dtype)
+                    jax.debug.print(
+                        "[LE chunk {}/{} pre] nonzero={} zero_mel={} "
+                        "raw_M_min={} raw_M_max={} safe_M_min={} safe_M_max={} "
+                        "bad_nonzero_target_M={} mel_abs_max={:.6e}",
+                        chunk_idx + 1,
+                        n_chunks,
+                        jnp.sum(nonzero_flat),
+                        jnp.sum(~nonzero_flat),
+                        jnp.min(mag_flat),
+                        jnp.max(mag_flat),
+                        jnp.min(mag_safe),
+                        jnp.max(mag_safe),
+                        jnp.sum(nonzero_flat & (mag_flat != target)),
+                        jnp.max(jnp.abs(mel_flat)),
+                        ordered=True,
+                    )
+                    return jnp.int32(0)
+
+                def no_pre_print(_):
+                    return jnp.int32(0)
+
+                _ = jax.lax.cond(should_print_pre, do_pre_print, no_pre_print, operand=None)
+
+            logpsi_xp = apply_logpsi_explicit(model, params, x_flat_safe)
             logpsi_xp = logpsi_xp.astype(compute_dtype).reshape(B, C)
 
-            ratio = jnp.exp(logpsi_xp - logpsi_x[:, None])
-            e_acc = e_acc + jnp.sum(mel_chunk * ratio, axis=1)
+            nonzero_mel = mel_chunk != 0
+            log_ratio_raw = logpsi_xp - logpsi_x[:, None]
+            log_ratio = jnp.where(nonzero_mel, log_ratio_raw, jnp.zeros_like(log_ratio_raw))
+
+            # Clip only the real part. The imaginary part is a phase difference.
+            log_ratio = (
+                jnp.clip(jnp.real(log_ratio), -30.0, 30.0)
+                + 1j * jnp.imag(log_ratio)
+            ).astype(compute_dtype)
+
+            ratio = jnp.exp(log_ratio)
+            contrib = jnp.where(nonzero_mel, mel_chunk * ratio, jnp.zeros_like(ratio))
+            e_acc = e_acc + jnp.sum(contrib, axis=1)
 
             if debug_progress:
                 should_print = (chunk_idx % debug_print_every_chunks == 0) | (
@@ -274,6 +580,26 @@ def make_local_energy_fn(
                 )
 
                 def do_print(_):
+                    jax.debug.print(
+                        "[LE chunk {}/{} finite] logpsi_xp={} log_ratio={} ratio={} contrib={} e_acc={} "
+                        "nan_logpsi_xp={} nan_ratio={} nan_contrib={} nan_e_acc={}",
+                        chunk_idx + 1,
+                        n_chunks,
+                        jnp.all(jnp.isfinite(logpsi_xp)),
+                        jnp.all(jnp.isfinite(log_ratio)),
+                        jnp.all(jnp.isfinite(ratio)),
+                        jnp.all(jnp.isfinite(contrib)),
+                        jnp.all(jnp.isfinite(e_acc)),
+                        jnp.sum(jnp.isnan(jnp.real(logpsi_xp)))
+                        + jnp.sum(jnp.isnan(jnp.imag(logpsi_xp))),
+                        jnp.sum(jnp.isnan(jnp.real(ratio)))
+                        + jnp.sum(jnp.isnan(jnp.imag(ratio))),
+                        jnp.sum(jnp.isnan(jnp.real(contrib)))
+                        + jnp.sum(jnp.isnan(jnp.imag(contrib))),
+                        jnp.sum(jnp.isnan(jnp.real(e_acc)))
+                        + jnp.sum(jnp.isnan(jnp.imag(e_acc))),
+                        ordered=True,
+                    )
                     jax.debug.print(
                         "[local_energy] chunk {}/{} done, partial mean Re(E)={:.6f}, mean |E|={:.6f}",
                         chunk_idx + 1,
@@ -296,9 +622,13 @@ def make_local_energy_fn(
 
         if debug_progress:
             jax.debug.print(
-                "[local_energy] done: mean Re(E)={:.6f}, std Re(E)={:.6f}",
+                "[LE done] e_loc_finite={} nan_e_loc={} mean_Re={:.6f} std_Re={:.6f} mean_abs={:.6f}",
+                jnp.all(jnp.isfinite(e_loc)),
+                jnp.sum(jnp.isnan(jnp.real(e_loc)))
+                + jnp.sum(jnp.isnan(jnp.imag(e_loc))),
                 jnp.mean(jnp.real(e_loc)),
                 jnp.std(jnp.real(e_loc)),
+                jnp.mean(jnp.abs(e_loc)),
                 ordered=True,
             )
 
@@ -317,6 +647,8 @@ def main(cfg: Args) -> None:
         raise ValueError("width must be divisible by num_heads")
     if (cfg.width // cfg.num_heads) % 4 != 0:
         raise ValueError("head_dim must be divisible by 4 for 2D axial RoPE")
+    if cfg.use_patch_ar and (cfg.L % cfg.patch_size != 0):
+        raise ValueError("For patch AR, L must be divisible by patch_size")
 
     cache_dtype = cache_dtype_from_string(cfg.kv_cache_dtype)
 
@@ -343,7 +675,20 @@ def main(cfg: Args) -> None:
     hi, graph, h_nk = build_square_j1j2(cfg)
     h_jax = h_nk.to_jax_operator() if hasattr(h_nk, "to_jax_operator") else h_nk
 
-    dummy_configs = jnp.ones((2, n_sites), dtype=jnp.int32)
+    target_magnetization = target_magnetization_from_total_sz(cfg.total_sz)
+    entropy_max = max_entropy_for_hilbert(
+        n_sites,
+        target_magnetization,
+        cfg.enforce_zero_magnetization,
+    )
+    if cfg.enforce_zero_magnetization:
+        dummy_configs = make_fixed_magnetization_configs(
+            2,
+            n_sites,
+            target_magnetization=target_magnetization,
+        )
+    else:
+        dummy_configs = jnp.ones((2, n_sites), dtype=jnp.int32)
     dummy_xp, dummy_mels = h_jax.get_conn_padded(dummy_configs)
     jax.block_until_ready(dummy_xp)
     jax.block_until_ready(dummy_mels)
@@ -352,14 +697,38 @@ def main(cfg: Args) -> None:
     model = make_model(cfg, hi)
 
     init_key = jax.random.PRNGKey(cfg.seed)
-    dummy_input = jnp.ones((1, n_sites), dtype=jnp.int32)
-    variables0 = model.init(init_key, dummy_input)
+    if cfg.enforce_zero_magnetization:
+        dummy_input = make_fixed_magnetization_configs(
+            1,
+            n_sites,
+            target_magnetization=target_magnetization,
+        )
+    else:
+        dummy_input = jnp.ones((1, n_sites), dtype=jnp.int32)
+    variables0 = model.init(
+        init_key,
+        dummy_input,
+        train=False,
+        method=model.conditionals_log_psi,
+    )
     params0 = variables0["params"]
 
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params0))
+    ar_tokens = (cfg.L // cfg.patch_size) ** 2 if cfg.use_patch_ar else n_sites
+    model_name = "ComplexPatchRoPETransformer2DAR" if cfg.use_patch_ar else "ComplexRoPETransformer2DAR"
     print(
-        f"Model: ComplexRoPETransformer2DAR cached  L={cfg.L}  N={n_sites}  "
-        f"J2/J1={cfg.J2 / cfg.J1:.3f}  Parameters: {n_params:,}"
+        f"Model: {model_name} cached  L={cfg.L}  N={n_sites}  "
+        f"AR_tokens={ar_tokens}  patch_size={cfg.patch_size if cfg.use_patch_ar else 1}  "
+        f"J2/J1={cfg.J2 / cfg.J1:.3f}  "
+        f"target_M={target_magnetization}  "
+        f"zero_mag_mask={cfg.enforce_zero_magnetization}  "
+        f"prefix_features={cfg.use_prefix_features}  "
+        f"prefix_feature_dim={cfg.prefix_feature_dim}  "
+        f"Parameters: {n_params:,}"
+    )
+    print(
+        f"Max support entropy: {entropy_max:.6f} nats  "
+        f"({entropy_max / n_sites:.6f} nats/site)"
     )
 
     if cfg.validate_cached_sampler:
@@ -376,7 +745,7 @@ def main(cfg: Args) -> None:
             test_configs.astype(jnp.int32),
             method=model.conditionals_log_psi,
         )
-        from .ar_vit_rope_2d_cached import cached_conditionals_for_inputs
+        from .vit_rope_v2 import cached_conditionals_for_inputs
 
         conds_cached = cached_conditionals_for_inputs(
             model,
@@ -428,7 +797,7 @@ def main(cfg: Args) -> None:
     def loss_terms_on_batch(params, batch):
         configs, old_logp, old_phase, e_loc = batch
 
-        new_logpsi = model.apply({"params": params}, configs)
+        new_logpsi = apply_logpsi_explicit(model, params, configs)
         new_logp = cfg.machine_pow * jnp.real(new_logpsi)
         new_phase = jnp.imag(new_logpsi)
 
@@ -452,6 +821,24 @@ def main(cfg: Args) -> None:
         )
 
         e_imag = jnp.imag(e_loc)
+        magnetization = jnp.sum(configs, axis=-1)
+        mag_deviation = magnetization - jnp.asarray(
+            target_magnetization,
+            dtype=magnetization.dtype,
+        )
+
+        # On-policy sample entropy estimate: H[p_theta] = E[-log p_theta(s)].
+        # old_logp is the cached sampling log-probability from the frozen batch policy.
+        sample_surprisal = -old_logp
+        entropy_mean = jnp.mean(sample_surprisal)
+        entropy_std = jnp.std(sample_surprisal)
+        entropy_max_jnp = jnp.asarray(entropy_max, dtype=entropy_mean.dtype)
+        entropy_frac_max = jnp.where(
+            entropy_max_jnp > 0.0,
+            entropy_mean / entropy_max_jnp,
+            jnp.asarray(float("nan"), dtype=entropy_mean.dtype),
+        )
+
         adv_phase = e_imag
         if cfg.center_imag_advantage:
             adv_phase = adv_phase - jnp.mean(adv_phase)
@@ -514,6 +901,11 @@ def main(cfg: Args) -> None:
             "E_std_real": jnp.std(e_real),
             "E_mean_imag": jnp.mean(e_imag),
             "E_std_imag": jnp.std(e_imag),
+            "entropy": entropy_mean,
+            "entropy_std": entropy_std,
+            "entropy_per_site": entropy_mean / n_sites,
+            "entropy_frac_max": entropy_frac_max,
+            "entropy_max": entropy_max_jnp,
             "ratio_mean": jnp.mean(ratio_real),
             "clip_frac": jnp.mean(jnp.abs(ratio_real - 1.0) > cfg.ppo_clip_eps),
             "approx_kl": jnp.mean(old_logp - new_logp),
@@ -523,6 +915,11 @@ def main(cfg: Args) -> None:
             "phase_delta_rms": jnp.sqrt(jnp.mean(phase_delta**2)),
             "phase_stat_mean": jnp.mean(phase_stat),
             "phase_stat_abs_mean": jnp.mean(jnp.abs(phase_stat)),
+            "magnetization_mean": jnp.mean(magnetization.astype(jnp.float32)),
+            "magnetization_abs_mean": jnp.mean(jnp.abs(magnetization).astype(jnp.float32)),
+            "magnetization_deviation_abs_mean": jnp.mean(jnp.abs(mag_deviation).astype(jnp.float32)),
+            "magnetization_deviation_max_abs": jnp.max(jnp.abs(mag_deviation).astype(jnp.float32)),
+            "magnetization_target_frac": jnp.mean(mag_deviation == 0),
         }
         if cfg.reference_energy is not None:
             reference = jnp.asarray(cfg.reference_energy, dtype=e_real.dtype)
@@ -534,7 +931,7 @@ def main(cfg: Args) -> None:
 
     def phase_backward_weights(params, batch):
         configs, old_logp, old_phase, e_loc = batch
-        new_logpsi = model.apply({"params": params}, configs)
+        new_logpsi = apply_logpsi_explicit(model, params, configs)
         new_logp = cfg.machine_pow * jnp.real(new_logpsi)
         new_phase = jnp.imag(new_logpsi)
 
@@ -591,7 +988,7 @@ def main(cfg: Args) -> None:
 
     def phase_linearized_objective(params, batch, weights):
         configs, _, _, _ = batch
-        new_logpsi = model.apply({"params": params}, configs)
+        new_logpsi = apply_logpsi_explicit(model, params, configs)
         new_phase = jnp.imag(new_logpsi)
         return jnp.sum(jax.lax.stop_gradient(weights) * new_phase)
 
@@ -621,7 +1018,7 @@ def main(cfg: Args) -> None:
 
     @jax.jit
     def eval_sample_chunk(params, key):
-        configs, _ = sample_cached_apply(
+        configs, logpsi = sample_cached_apply(
             model,
             {"params": params},
             key,
@@ -629,14 +1026,28 @@ def main(cfg: Args) -> None:
             cache_dtype=cache_dtype,
         )
         configs = configs.astype(jnp.int32)
+        sample_logp = cfg.machine_pow * jnp.real(logpsi)
+        sample_surprisal = -sample_logp
         e_loc = local_energy(params, configs)
         e_real = jnp.real(e_loc)
         e_imag = jnp.imag(e_loc)
+        magnetization = jnp.sum(configs, axis=-1)
+        mag_deviation = magnetization - jnp.asarray(
+            target_magnetization,
+            dtype=magnetization.dtype,
+        )
         return (
             jnp.sum(e_real),
             jnp.sum(e_real**2),
             jnp.sum(e_imag),
             jnp.sum(jnp.abs(e_imag)),
+            jnp.sum(sample_surprisal),
+            jnp.sum(sample_surprisal**2),
+            jnp.sum(magnetization),
+            jnp.sum(jnp.abs(magnetization)),
+            jnp.sum(jnp.abs(mag_deviation)),
+            jnp.max(jnp.abs(mag_deviation)),
+            jnp.sum(mag_deviation == 0),
             e_real.shape[0],
         )
 
@@ -645,13 +1056,33 @@ def main(cfg: Args) -> None:
         total_real_sq = 0.0
         total_imag = 0.0
         total_abs_imag = 0.0
+        total_entropy = 0.0
+        total_entropy_sq = 0.0
+        total_mag = 0.0
+        total_abs_mag = 0.0
+        total_abs_mag_deviation = 0.0
+        max_abs_mag_deviation = 0.0
+        total_target_mag = 0
         total_n = 0
 
         n_chunks = (cfg.eval_n_samples + cfg.eval_batch_size - 1) // cfg.eval_batch_size
         keys = jax.random.split(eval_key, n_chunks)
 
         for key in keys:
-            real_sum, real_sq_sum, imag_sum, abs_imag_sum, chunk_n = eval_sample_chunk(
+            (
+                real_sum,
+                real_sq_sum,
+                imag_sum,
+                abs_imag_sum,
+                entropy_sum,
+                entropy_sq_sum,
+                mag_sum,
+                abs_mag_sum,
+                abs_mag_dev_sum,
+                max_abs_mag_dev,
+                target_mag_sum,
+                chunk_n,
+            ) = eval_sample_chunk(
                 state.params,
                 key,
             )
@@ -659,12 +1090,23 @@ def main(cfg: Args) -> None:
             total_real_sq += float(real_sq_sum)
             total_imag += float(imag_sum)
             total_abs_imag += float(abs_imag_sum)
+            total_entropy += float(entropy_sum)
+            total_entropy_sq += float(entropy_sq_sum)
+            total_mag += float(mag_sum)
+            total_abs_mag += float(abs_mag_sum)
+            total_abs_mag_deviation += float(abs_mag_dev_sum)
+            max_abs_mag_deviation = max(max_abs_mag_deviation, float(max_abs_mag_dev))
+            total_target_mag += int(target_mag_sum)
             total_n += int(chunk_n)
 
         energy_real = total_real / total_n
         variance_real = max(total_real_sq / total_n - energy_real**2, 0.0)
         energy_imag = total_imag / total_n
         abs_imag_mean = total_abs_imag / total_n
+        entropy_mean = total_entropy / total_n
+        entropy_var = max(total_entropy_sq / total_n - entropy_mean**2, 0.0)
+        entropy_std = math.sqrt(entropy_var)
+        entropy_frac_max = entropy_mean / entropy_max if entropy_max > 0.0 else float("nan")
         denom = max(energy_real * energy_real, 1e-12)
 
         out = {
@@ -672,7 +1114,17 @@ def main(cfg: Args) -> None:
             "eval_E_mean_imag": energy_imag,
             "eval_E_var_real": variance_real,
             "eval_abs_E_imag_mean": abs_imag_mean,
+            "eval_entropy": entropy_mean,
+            "eval_entropy_std": entropy_std,
+            "eval_entropy_per_site": entropy_mean / n_sites,
+            "eval_entropy_frac_max": entropy_frac_max,
+            "eval_entropy_max": entropy_max,
             "eval_V_score": float(n_sites * variance_real / denom),
+            "eval_magnetization_mean": total_mag / total_n,
+            "eval_magnetization_abs_mean": total_abs_mag / total_n,
+            "eval_magnetization_deviation_abs_mean": total_abs_mag_deviation / total_n,
+            "eval_magnetization_deviation_max_abs": max_abs_mag_deviation,
+            "eval_magnetization_target_frac": total_target_mag / total_n,
             "eval_n_samples_used": total_n,
         }
         if cfg.reference_energy is not None:
@@ -776,10 +1228,14 @@ def main(cfg: Args) -> None:
                 f"Lphase={float(metrics['loss_phase']): .6f}  "
                 f"E_real={float(metrics['E_mean_real']): .6f} ± {float(metrics['E_std_real']): .6f}  "
                 f"E_imag={float(metrics['E_mean_imag']): .6f} ± {float(metrics['E_std_imag']): .6f}  "
+                f"S={float(metrics['entropy']): .3f}  "
+                f"S/Smax={float(metrics['entropy_frac_max']): .3f}  "
                 f"ratio={float(metrics['ratio_mean']): .6f}  "
                 f"clip={float(metrics['clip_frac']): .3f}  "
                 f"kl={float(metrics['approx_kl']): .3e}  "
                 f"dphi_rms={float(metrics['phase_delta_rms']): .3e}  "
+                f"|M-target|={float(metrics['magnetization_deviation_abs_mean']): .3e}  "
+                f"M_ok={float(metrics['magnetization_target_frac']): .3f}  "
                 f"||g||={float(metrics['grad_norm']): .3e}  "
                 f"||θ||={float(metrics['param_norm']): .3e}"
             )
@@ -841,7 +1297,11 @@ def main(cfg: Args) -> None:
                 f"E_imag={eval_metrics['eval_E_mean_imag']:.8e}  "
                 f"Var_real={eval_metrics['eval_E_var_real']:.8e}  "
                 f"|E_imag|={eval_metrics['eval_abs_E_imag_mean']:.8e}  "
-                f"V_score={eval_metrics['eval_V_score']:.8e}"
+                f"S={eval_metrics['eval_entropy']:.6f}  "
+                f"S/Smax={eval_metrics['eval_entropy_frac_max']:.3f}  "
+                f"V_score={eval_metrics['eval_V_score']:.8e}  "
+                f"|M-target|={eval_metrics['eval_magnetization_deviation_abs_mean']:.3e}  "
+                f"M_ok={eval_metrics['eval_magnetization_target_frac']:.3f}"
             )
             if cfg.reference_energy is not None:
                 eval_msg += f"  rel_ref={eval_metrics['eval_rel_error_reference']:.8e}"
@@ -865,7 +1325,9 @@ def main(cfg: Args) -> None:
         "Final sampled energy: "
         f"{final_metrics['eval_E_mean_real']:.10f} + "
         f"{final_metrics['eval_E_mean_imag']:.3e}j  "
-        f"per site: {final_metrics['eval_E_mean_real'] / n_sites:.10f}"
+        f"per site: {final_metrics['eval_E_mean_real'] / n_sites:.10f}  "
+        f"entropy: {final_metrics['eval_entropy']:.6f} "
+        f"({final_metrics['eval_entropy_frac_max']:.3f} of max)"
     )
 
     if cfg.wandb_mode != "disabled":
@@ -874,6 +1336,15 @@ def main(cfg: Args) -> None:
             "final_E_imag": float(final_metrics["eval_E_mean_imag"]),
             "final_E_per_site": float(final_metrics["eval_E_mean_real"] / n_sites),
             "final_V_score": float(final_metrics["eval_V_score"]),
+            "final_entropy": float(final_metrics["eval_entropy"]),
+            "final_entropy_per_site": float(final_metrics["eval_entropy_per_site"]),
+            "final_entropy_frac_max": float(final_metrics["eval_entropy_frac_max"]),
+            "final_magnetization_deviation_abs_mean": float(
+                final_metrics["eval_magnetization_deviation_abs_mean"]
+            ),
+            "final_magnetization_target_frac": float(
+                final_metrics["eval_magnetization_target_frac"]
+            ),
         })
         wandb.finish()
 
