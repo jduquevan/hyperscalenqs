@@ -1,5 +1,7 @@
 wandb/
 outputs/
+logs/
 *.pyc
 notebooks/
 *.pdf
+.env
