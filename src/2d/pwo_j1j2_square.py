@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import math
-import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -25,8 +24,8 @@ import orbax.checkpoint as ocp
 from flax.training import train_state
 
 from .vit_rope import (
+    PATCH_SIZE,
     ComplexPatchRoPETransformer2DAR,
-    ComplexRoPETransformer2DAR,
     configs_to_patch_tokens,
     magnetization_to_targets,
     sample_cached_apply,
@@ -48,8 +47,6 @@ class Args:
     n_samples: int = 1024
     machine_pow: int = 2
 
-    use_patch_ar: bool = True
-    patch_size: int = 2
     use_input_tanh: bool = False
 
     use_prefix_features: bool = True
@@ -62,21 +59,12 @@ class Args:
     mlp_dim: Optional[int] = None
     head_hidden: int = 192
     use_site_embedding: bool = True
-    # 100 is usually a better starting point than the LLM default 10_000 for a 5x5
-    # patch lattice / 10x10 spin lattice.
     rope_base: float = 100.0
     dropout: float = 0.0
     residual_scale: float = 1.0
     phase_scale: float = math.pi
     phase_init_std: float = 1e-3
 
-    # Learning-rate schedule.
-    #
-    # Supported values:
-    #   - "warmup_const_decay" (default): warm up, hold, then drop once.
-    #   - "constant": fixed LR = peak_lr.
-    #   - "cosine_onecycle" / "onecycle" / "cosine": original Optax one-cycle schedule.
-    #   - "cosine_decay": warmup followed by cosine decay from peak_lr to end_lr.
     lr_schedule_type: str = "constant"
     peak_lr: float = 0.0001
     warmup_outer_steps: int = 25
@@ -105,24 +93,16 @@ class Args:
     normalize_imag_advantage: bool = True
     phase_delta_l2_coef: float = 0.0
 
-    use_phase_jacobian_baseline: bool = False
-    phase_jacobian_baseline_eps: float = 1e-8
 
     eval_every: int = 300
     eval_n_samples: int = 32768
-    # eval_n_samples: int = 262_144
     eval_batch_size: int = 1024
     reference_energy: Optional[float] = None
 
     local_energy_conn_chunk_size: int = 16
-    debug_local_energy_progress: bool = False
-    debug_local_energy_print_every_chunks: int = 1
     kv_cache_dtype: str = "float32"
-    validate_cached_sampler: bool = False
 
     log_every: int = 1
-    log_gradient_info: bool = False
-    time_optimization_steps: bool = False
 
     save_checkpoint_every: int = 0
     output_directory: Optional[str] = "."
@@ -140,18 +120,6 @@ ConfigStore.instance().store(name="config", node=Args)
 
 class TrainState(train_state.TrainState):
     rng: jax.Array
-
-
-def tree_add(a, b):
-    return jax.tree_util.tree_map(lambda x, y: x + y, a, b)
-
-
-def tree_scale(tree, scalar):
-    return jax.tree_util.tree_map(lambda x: scalar * x, tree)
-
-
-def tree_l2_sq(tree):
-    return sum(jnp.sum(x * x) for x in jax.tree_util.tree_leaves(tree))
 
 
 def cache_dtype_from_string(name: str):
@@ -245,7 +213,6 @@ def make_tx(cfg: Args):
 
 
 def target_magnetization_from_total_sz(total_sz: float) -> int:
-    """Converts NetKet total_sz=sum_i S_i^z to M=sum_i s_i for s_i in {-1,+1}."""
     target = 2.0 * float(total_sz)
     rounded = int(round(target))
     if abs(target - rounded) > 1e-6:
@@ -256,7 +223,6 @@ def target_magnetization_from_total_sz(total_sz: float) -> int:
 
 
 def log_num_fixed_magnetization_configs(n_sites: int, target_magnetization: int) -> float:
-    """Returns log of the number of spin configurations with sum_i s_i = target_magnetization."""
     if abs(target_magnetization) > n_sites:
         raise ValueError(
             f"target_magnetization={target_magnetization} is outside [-N, N] for N={n_sites}."
@@ -275,7 +241,6 @@ def log_num_fixed_magnetization_configs(n_sites: int, target_magnetization: int)
 
 
 def max_entropy_for_hilbert(n_sites: int, target_magnetization: int, enforce_fixed_magnetization: bool) -> float:
-    """Maximum entropy of the sampling support in nats."""
     if enforce_fixed_magnetization:
         return log_num_fixed_magnetization_configs(n_sites, target_magnetization)
     return n_sites * math.log(2.0)
@@ -286,7 +251,6 @@ def make_fixed_magnetization_configs(
     n_sites: int,
     target_magnetization: int = 0,
 ) -> jax.Array:
-    """Creates simple valid spin configurations with fixed M=sum_i s_i."""
     target_down, target_up = magnetization_to_targets(n_sites, target_magnetization)
     one = jnp.concatenate([
         -jnp.ones((target_down,), dtype=jnp.int32),
@@ -317,7 +281,7 @@ def build_square_j1j2(cfg: Args):
 
 
 def make_model(cfg: Args, hilbert):
-    common_kwargs = dict(
+    return ComplexPatchRoPETransformer2DAR(
         hilbert=hilbert,
         lattice_shape=(cfg.L, cfg.L),
         embed_dim=cfg.embed_dim,
@@ -337,26 +301,11 @@ def make_model(cfg: Args, hilbert):
         target_magnetization=target_magnetization_from_total_sz(cfg.total_sz),
         use_prefix_features=cfg.use_prefix_features,
         prefix_feature_dim=cfg.prefix_feature_dim,
+        use_input_tanh=cfg.use_input_tanh,
     )
-    if cfg.use_patch_ar:
-        return ComplexPatchRoPETransformer2DAR(
-            **common_kwargs,
-            patch_size=cfg.patch_size,
-            use_input_tanh=cfg.use_input_tanh,
-        )
-    return ComplexRoPETransformer2DAR(**common_kwargs)
-
-
 
 
 def apply_logpsi_explicit(model, params, configs):
-    """Evaluate log psi by explicitly gathering the selected AR token log-psi.
-
-    For the original site AR model this gathers one binary token per spin. For
-    v2 patch AR, the physical spin configuration is first converted into patch
-    tokens and then one categorical token is gathered per patch. In both cases
-    the returned value is log psi for the physical spin configuration.
-    """
     if configs.ndim == 1:
         configs = configs[None, :]
     configs = configs.astype(jnp.int32)
@@ -366,116 +315,29 @@ def apply_logpsi_explicit(model, params, configs):
         train=False,
         method=model.conditionals_log_psi,
     )
-
-    if bool(getattr(model, "is_patch_ar", False)):
-        patch_tokens = configs_to_patch_tokens(
-            configs,
-            lattice_shape=model.lattice_shape,
-            patch_size=model.patch_size,
-        )
-        selected = jnp.take_along_axis(
-            cond_logpsi,
-            patch_tokens[..., None],
-            axis=-1,
-        )[..., 0]
-        return jnp.sum(selected, axis=-1)
-
-    spin_tokens = (configs > 0).astype(jnp.int32)
-    selected = jnp.take_along_axis(
-        cond_logpsi,
-        spin_tokens[..., None],
-        axis=-1,
-    )[..., 0]
+    patch_tokens = configs_to_patch_tokens(
+        configs,
+        lattice_shape=model.lattice_shape,
+        patch_size=PATCH_SIZE,
+    )
+    selected = jnp.take_along_axis(cond_logpsi, patch_tokens[..., None], axis=-1)[..., 0]
     return jnp.sum(selected, axis=-1)
 
-def make_local_energy_fn(
-    model,
-    H,
-    conn_chunk_size: int = 1,
-    *,
-    debug_progress: bool = False,
-    debug_print_every_chunks: int = 1,
-):
-    """
-    Local energy with aggressive NaN diagnostics for fixed-magnetization masked AR models.
 
-    Important details:
-      * Padded zero-matrix-element connected states are never scored by the model.
-        They are replaced by the original valid configuration before model.apply.
-      * Ratio computation is masked before exp, so zero-mel entries cannot create 0 * NaN.
-      * Debug prints are intentionally labelled [LE ...] so you can verify this file is running.
-    """
+def make_local_energy_fn(model, H, conn_chunk_size: int = 1):
     if conn_chunk_size < 1:
         raise ValueError("conn_chunk_size must be >= 1")
-    if debug_print_every_chunks < 1:
-        raise ValueError("debug_print_every_chunks must be >= 1")
-
-    target_magnetization = int(getattr(model, "target_magnetization", 0))
-    enforce_fixed_magnetization = bool(
-        getattr(model, "enforce_zero_magnetization", False)
-    )
 
     def local_energy(params, configs):
         configs = configs.astype(jnp.int32)
-
         x_primes, mels = H.get_conn_padded(configs)
         logpsi_x = apply_logpsi_explicit(model, params, configs)
-
         compute_dtype = logpsi_x.dtype
         mels = mels.astype(compute_dtype)
 
-        B, K, N = x_primes.shape
-        C = conn_chunk_size
-
-        if debug_progress:
-            mag_configs = jnp.sum(configs, axis=-1)
-            target = jnp.asarray(target_magnetization, dtype=mag_configs.dtype)
-            jax.debug.print(
-                "[LE input] B={} K={} N={} C={} target_M={} enforce_fixed_M={} "
-                "configs_finite={} logpsi_x_finite={} "
-                "M_min={} M_max={} mean_abs_Merr={:.6e}",
-                B,
-                K,
-                N,
-                C,
-                target_magnetization,
-                enforce_fixed_magnetization,
-                jnp.all(jnp.isfinite(configs)),
-                jnp.all(jnp.isfinite(logpsi_x)),
-                jnp.min(mag_configs),
-                jnp.max(mag_configs),
-                jnp.mean(jnp.abs(mag_configs - target)),
-                ordered=True,
-            )
-            jax.debug.print(
-                "[LE logpsi_x] finite={} nan_count={} "
-                "real_min={:.6e} real_max={:.6e} imag_min={:.6e} imag_max={:.6e}",
-                jnp.all(jnp.isfinite(logpsi_x)),
-                jnp.sum(jnp.isnan(jnp.real(logpsi_x)))
-                + jnp.sum(jnp.isnan(jnp.imag(logpsi_x))),
-                jnp.nanmin(jnp.real(logpsi_x)),
-                jnp.nanmax(jnp.real(logpsi_x)),
-                jnp.nanmin(jnp.imag(logpsi_x)),
-                jnp.nanmax(jnp.imag(logpsi_x)),
-                ordered=True,
-            )
-
-            xprime_mag = jnp.sum(x_primes, axis=-1)
-            nonzero_conn = mels != 0
-            target = jnp.asarray(target_magnetization, dtype=xprime_mag.dtype)
-            jax.debug.print(
-                "[LE conn] x_primes_finite={} mels_finite={} nonzero_mels={} "
-                "xprime_M_min={} xprime_M_max={} bad_nonzero_target_M={}",
-                jnp.all(jnp.isfinite(x_primes)),
-                jnp.all(jnp.isfinite(mels)),
-                jnp.sum(nonzero_conn),
-                jnp.min(xprime_mag),
-                jnp.max(xprime_mag),
-                jnp.sum(nonzero_conn & (xprime_mag != target)),
-                ordered=True,
-            )
-
-        pad_k = (-K) % C
+        batch_size, n_conn, n_sites = x_primes.shape
+        chunk_size = conn_chunk_size
+        pad_k = (-n_conn) % chunk_size
         if pad_k > 0:
             x_primes = jnp.pad(
                 x_primes,
@@ -490,148 +352,44 @@ def make_local_energy_fn(
                 constant_values=0,
             )
 
-        K_pad = K + pad_k
-        n_chunks = K_pad // C
-
-        x_chunks = x_primes.reshape(B, n_chunks, C, N)
-        m_chunks = mels.reshape(B, n_chunks, C)
-
+        n_chunks = (n_conn + pad_k) // chunk_size
+        x_chunks = x_primes.reshape(batch_size, n_chunks, chunk_size, n_sites)
+        m_chunks = mels.reshape(batch_size, n_chunks, chunk_size)
         x_chunks = jnp.swapaxes(x_chunks, 0, 1)
         m_chunks = jnp.swapaxes(m_chunks, 0, 1)
-        chunk_ids = jnp.arange(n_chunks, dtype=jnp.int32)
-
-        if debug_progress:
-            jax.debug.print(
-                "[local_energy] start: B={} K={} C={} n_chunks={} effective_batch={}",
-                B,
-                K,
-                C,
-                n_chunks,
-                B * C,
-                ordered=True,
-            )
 
         def scan_chunk(e_acc, xs):
-            chunk_idx, x_chunk, mel_chunk = xs
-
-            x_flat = x_chunk.reshape(B * C, N)
-            mel_flat = mel_chunk.reshape(B * C)
+            x_chunk, mel_chunk = xs
+            x_flat = x_chunk.reshape(batch_size * chunk_size, n_sites)
+            mel_flat = mel_chunk.reshape(batch_size * chunk_size)
             nonzero_flat = mel_flat != 0
+            x_ref_flat = jnp.repeat(configs[:, None, :], chunk_size, axis=1).reshape(
+                batch_size * chunk_size,
+                n_sites,
+            )
+            x_flat = jnp.where(nonzero_flat[:, None], x_flat, x_ref_flat)
 
-            # Do not evaluate padded zero-mel states under the masked AR model.
-            # Some padded states can be impossible under the fixed-M constraint.
-            # Replacing them by the original valid config prevents logpsi NaNs from
-            # irrelevant zero-mel entries.
-            x_ref_flat = jnp.repeat(configs[:, None, :], C, axis=1).reshape(B * C, N)
-            x_flat_safe = jnp.where(nonzero_flat[:, None], x_flat, x_ref_flat)
-
-            if debug_progress:
-                should_print_pre = (chunk_idx % debug_print_every_chunks == 0) | (
-                    chunk_idx == n_chunks - 1
-                )
-
-                def do_pre_print(_):
-                    mag_flat = jnp.sum(x_flat, axis=-1)
-                    mag_safe = jnp.sum(x_flat_safe, axis=-1)
-                    target = jnp.asarray(target_magnetization, dtype=mag_flat.dtype)
-                    jax.debug.print(
-                        "[LE chunk {}/{} pre] nonzero={} zero_mel={} "
-                        "raw_M_min={} raw_M_max={} safe_M_min={} safe_M_max={} "
-                        "bad_nonzero_target_M={} mel_abs_max={:.6e}",
-                        chunk_idx + 1,
-                        n_chunks,
-                        jnp.sum(nonzero_flat),
-                        jnp.sum(~nonzero_flat),
-                        jnp.min(mag_flat),
-                        jnp.max(mag_flat),
-                        jnp.min(mag_safe),
-                        jnp.max(mag_safe),
-                        jnp.sum(nonzero_flat & (mag_flat != target)),
-                        jnp.max(jnp.abs(mel_flat)),
-                        ordered=True,
-                    )
-                    return jnp.int32(0)
-
-                def no_pre_print(_):
-                    return jnp.int32(0)
-
-                _ = jax.lax.cond(should_print_pre, do_pre_print, no_pre_print, operand=None)
-
-            logpsi_xp = apply_logpsi_explicit(model, params, x_flat_safe)
-            logpsi_xp = logpsi_xp.astype(compute_dtype).reshape(B, C)
-
+            logpsi_xp = apply_logpsi_explicit(model, params, x_flat)
+            logpsi_xp = logpsi_xp.astype(compute_dtype).reshape(batch_size, chunk_size)
             nonzero_mel = mel_chunk != 0
-            log_ratio_raw = logpsi_xp - logpsi_x[:, None]
-            log_ratio = jnp.where(nonzero_mel, log_ratio_raw, jnp.zeros_like(log_ratio_raw))
-
-            # Clip only the real part. The imaginary part is a phase difference.
+            log_ratio = jnp.where(
+                nonzero_mel,
+                logpsi_xp - logpsi_x[:, None],
+                jnp.zeros_like(logpsi_xp),
+            )
             log_ratio = (
                 jnp.clip(jnp.real(log_ratio), -30.0, 30.0)
                 + 1j * jnp.imag(log_ratio)
             ).astype(compute_dtype)
-
             ratio = jnp.exp(log_ratio)
-            contrib = jnp.where(nonzero_mel, mel_chunk * ratio, jnp.zeros_like(ratio))
-            e_acc = e_acc + jnp.sum(contrib, axis=1)
-
-            if debug_progress:
-                should_print = (chunk_idx % debug_print_every_chunks == 0) | (
-                    chunk_idx == n_chunks - 1
-                )
-
-                def do_print(_):
-                    jax.debug.print(
-                        "[LE chunk {}/{} finite] logpsi_xp={} log_ratio={} ratio={} contrib={} e_acc={} "
-                        "nan_logpsi_xp={} nan_ratio={} nan_contrib={} nan_e_acc={}",
-                        chunk_idx + 1,
-                        n_chunks,
-                        jnp.all(jnp.isfinite(logpsi_xp)),
-                        jnp.all(jnp.isfinite(log_ratio)),
-                        jnp.all(jnp.isfinite(ratio)),
-                        jnp.all(jnp.isfinite(contrib)),
-                        jnp.all(jnp.isfinite(e_acc)),
-                        jnp.sum(jnp.isnan(jnp.real(logpsi_xp)))
-                        + jnp.sum(jnp.isnan(jnp.imag(logpsi_xp))),
-                        jnp.sum(jnp.isnan(jnp.real(ratio)))
-                        + jnp.sum(jnp.isnan(jnp.imag(ratio))),
-                        jnp.sum(jnp.isnan(jnp.real(contrib)))
-                        + jnp.sum(jnp.isnan(jnp.imag(contrib))),
-                        jnp.sum(jnp.isnan(jnp.real(e_acc)))
-                        + jnp.sum(jnp.isnan(jnp.imag(e_acc))),
-                        ordered=True,
-                    )
-                    jax.debug.print(
-                        "[local_energy] chunk {}/{} done, partial mean Re(E)={:.6f}, mean |E|={:.6f}",
-                        chunk_idx + 1,
-                        n_chunks,
-                        jnp.mean(jnp.real(e_acc)),
-                        jnp.mean(jnp.abs(e_acc)),
-                        ordered=True,
-                    )
-                    return jnp.int32(0)
-
-                def no_print(_):
-                    return jnp.int32(0)
-
-                _ = jax.lax.cond(should_print, do_print, no_print, operand=None)
-
+            e_acc = e_acc + jnp.sum(
+                jnp.where(nonzero_mel, mel_chunk * ratio, jnp.zeros_like(ratio)),
+                axis=1,
+            )
             return e_acc, None
 
         e0 = jnp.zeros(logpsi_x.shape, dtype=compute_dtype)
-        e_loc, _ = jax.lax.scan(scan_chunk, e0, (chunk_ids, x_chunks, m_chunks))
-
-        if debug_progress:
-            jax.debug.print(
-                "[LE done] e_loc_finite={} nan_e_loc={} mean_Re={:.6f} std_Re={:.6f} mean_abs={:.6f}",
-                jnp.all(jnp.isfinite(e_loc)),
-                jnp.sum(jnp.isnan(jnp.real(e_loc)))
-                + jnp.sum(jnp.isnan(jnp.imag(e_loc))),
-                jnp.mean(jnp.real(e_loc)),
-                jnp.std(jnp.real(e_loc)),
-                jnp.mean(jnp.abs(e_loc)),
-                ordered=True,
-            )
-
+        e_loc, _ = jax.lax.scan(scan_chunk, e0, (x_chunks, m_chunks))
         return e_loc
 
     return local_energy
@@ -647,8 +405,8 @@ def main(cfg: Args) -> None:
         raise ValueError("width must be divisible by num_heads")
     if (cfg.width // cfg.num_heads) % 4 != 0:
         raise ValueError("head_dim must be divisible by 4 for 2D axial RoPE")
-    if cfg.use_patch_ar and (cfg.L % cfg.patch_size != 0):
-        raise ValueError("For patch AR, L must be divisible by patch_size")
+    if cfg.L % PATCH_SIZE != 0:
+        raise ValueError(f"L must be divisible by PATCH_SIZE={PATCH_SIZE}")
 
     cache_dtype = cache_dtype_from_string(cfg.kv_cache_dtype)
 
@@ -714,11 +472,11 @@ def main(cfg: Args) -> None:
     params0 = variables0["params"]
 
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params0))
-    ar_tokens = (cfg.L // cfg.patch_size) ** 2 if cfg.use_patch_ar else n_sites
-    model_name = "ComplexPatchRoPETransformer2DAR" if cfg.use_patch_ar else "ComplexRoPETransformer2DAR"
+    ar_tokens = (cfg.L // PATCH_SIZE) ** 2
+    model_name = "ComplexPatchRoPETransformer2DAR"
     print(
         f"Model: {model_name} cached  L={cfg.L}  N={n_sites}  "
-        f"AR_tokens={ar_tokens}  patch_size={cfg.patch_size if cfg.use_patch_ar else 1}  "
+        f"AR_tokens={ar_tokens}  patch_size={PATCH_SIZE}  "
         f"J2/J1={cfg.J2 / cfg.J1:.3f}  "
         f"target_M={target_magnetization}  "
         f"zero_mag_mask={cfg.enforce_zero_magnetization}  "
@@ -731,30 +489,6 @@ def main(cfg: Args) -> None:
         f"({entropy_max / n_sites:.6f} nats/site)"
     )
 
-    if cfg.validate_cached_sampler:
-        test_key = jax.random.PRNGKey(cfg.seed + 123)
-        test_configs, _ = sample_cached_apply(
-            model,
-            {"params": params0},
-            test_key,
-            batch_size=8,
-            cache_dtype=cache_dtype,
-        )
-        conds_full = model.apply(
-            {"params": params0},
-            test_configs.astype(jnp.int32),
-            method=model.conditionals_log_psi,
-        )
-        from .vit_rope_v2 import cached_conditionals_for_inputs
-
-        conds_cached = cached_conditionals_for_inputs(
-            model,
-            {"params": params0},
-            test_configs.astype(jnp.int32),
-            cache_dtype=cache_dtype,
-        )
-        max_diff = jnp.max(jnp.abs(conds_full - conds_cached))
-        print(f"cached/full conditional max diff: {float(max_diff):.6e}")
 
     tx, lr_schedule = make_tx(cfg)
     state = TrainState.create(
@@ -768,8 +502,6 @@ def main(cfg: Args) -> None:
         model,
         h_jax,
         conn_chunk_size=cfg.local_energy_conn_chunk_size,
-        debug_progress=cfg.debug_local_energy_progress,
-        debug_print_every_chunks=cfg.debug_local_energy_print_every_chunks,
     )
 
     def collect_batch(state):
@@ -827,8 +559,6 @@ def main(cfg: Args) -> None:
             dtype=magnetization.dtype,
         )
 
-        # On-policy sample entropy estimate: H[p_theta] = E[-log p_theta(s)].
-        # old_logp is the cached sampling log-probability from the frozen batch policy.
         sample_surprisal = -old_logp
         entropy_mean = jnp.mean(sample_surprisal)
         entropy_std = jnp.std(sample_surprisal)
@@ -928,93 +658,6 @@ def main(cfg: Args) -> None:
                 (metrics["E_mean_real"] - reference) / reference
             )
         return {"real": loss_real, "phase": loss_phase}, metrics
-
-    def phase_backward_weights(params, batch):
-        configs, old_logp, old_phase, e_loc = batch
-        new_logpsi = apply_logpsi_explicit(model, params, configs)
-        new_logp = cfg.machine_pow * jnp.real(new_logpsi)
-        new_phase = jnp.imag(new_logpsi)
-
-        log_ratio = jnp.clip(new_logp - old_logp, -20.0, 20.0)
-        is_ratio = jax.lax.stop_gradient(jnp.exp(log_ratio))
-
-        e_imag = jnp.imag(e_loc)
-        adv_phase = e_imag
-        if cfg.center_imag_advantage:
-            adv_phase = adv_phase - jnp.mean(adv_phase)
-        if cfg.normalize_imag_advantage:
-            adv_phase = adv_phase / (jnp.std(adv_phase) + 1e-8)
-
-        batch_size = adv_phase.shape[0]
-
-        if cfg.phase_loss_type == "delta_clip":
-            phase_delta = jnp.atan2(
-                jnp.sin(new_phase - old_phase),
-                jnp.cos(new_phase - old_phase),
-            )
-            clipped_phase_delta = jnp.clip(
-                phase_delta,
-                -cfg.phase_delta_clip,
-                cfg.phase_delta_clip,
-            )
-            active = (phase_delta * adv_phase >= clipped_phase_delta * adv_phase).astype(
-                new_phase.dtype
-            )
-            w = is_ratio * active * adv_phase / batch_size
-            if cfg.phase_delta_l2_coef > 0.0:
-                w = w + (2.0 * cfg.phase_delta_l2_coef / batch_size) * phase_delta
-
-        elif cfg.phase_loss_type == "ratio":
-            denom = jnp.where(
-                jnp.abs(old_phase) >= cfg.phase_ratio_tau,
-                old_phase,
-                jnp.where(old_phase >= 0.0, cfg.phase_ratio_tau, -cfg.phase_ratio_tau),
-            )
-            ratio_phase = new_phase / denom
-            clipped_ratio_phase = jnp.clip(
-                ratio_phase,
-                1.0 - cfg.phase_clip_eps,
-                1.0 + cfg.phase_clip_eps,
-            )
-            active = (ratio_phase * adv_phase >= clipped_ratio_phase * adv_phase).astype(
-                new_phase.dtype
-            )
-            w = is_ratio * active * (adv_phase / denom) / batch_size
-
-        else:
-            raise ValueError(f"Unknown phase_loss_type: {cfg.phase_loss_type}")
-
-        return jax.lax.stop_gradient(w.astype(new_phase.dtype))
-
-    def phase_linearized_objective(params, batch, weights):
-        configs, _, _, _ = batch
-        new_logpsi = apply_logpsi_explicit(model, params, configs)
-        new_phase = jnp.imag(new_logpsi)
-        return jnp.sum(jax.lax.stop_gradient(weights) * new_phase)
-
-    def phase_objective(params, batch):
-        weights = phase_backward_weights(params, batch)
-        return phase_linearized_objective(params, batch, weights)
-
-    def real_objective(params, batch):
-        losses, _ = loss_terms_on_batch(params, batch)
-        return losses["real"]
-
-    def apply_phase_jacobian_baseline(params, batch, grads_phase):
-        weights = phase_backward_weights(params, batch)
-        weights_sq = jax.lax.stop_gradient(weights**2)
-
-        c_num = jax.grad(phase_linearized_objective)(params, batch, weights_sq)
-        c_den = jnp.sum(weights_sq) + cfg.phase_jacobian_baseline_eps
-        c_tree = jax.tree_util.tree_map(
-            lambda x, g: jax.lax.stop_gradient((x / c_den).astype(g.dtype)),
-            c_num,
-            grads_phase,
-        )
-        return tree_add(
-            grads_phase,
-            tree_scale(c_tree, -jax.lax.stop_gradient(jnp.sum(weights))),
-        )
 
     @jax.jit
     def eval_sample_chunk(params, key):
@@ -1143,34 +786,15 @@ def main(cfg: Args) -> None:
             return losses["real"] + cfg.phase_coef * losses["phase"], (losses, metrics)
 
         def epoch_step(state, _):
-            if cfg.use_phase_jacobian_baseline:
-                losses, metrics = loss_terms_on_batch(state.params, batch)
-                grads_real = jax.grad(real_objective)(state.params, batch)
-                grads_phase = jax.grad(phase_objective)(state.params, batch)
-                grads_phase = apply_phase_jacobian_baseline(
-                    state.params,
-                    batch,
-                    grads_phase,
-                )
-                grads = tree_add(grads_real, tree_scale(grads_phase, cfg.phase_coef))
-                grad_norm_real = optax.global_norm(grads_real)
-                grad_norm_phase = optax.global_norm(grads_phase)
-            else:
-                (_, (losses, metrics)), grads = jax.value_and_grad(
-                    total_objective,
-                    argnums=0,
-                    has_aux=True,
-                )(state.params, batch)
-                grad_norm_real = jnp.array(float("nan"), dtype=metrics["loss"].dtype)
-                grad_norm_phase = jnp.array(float("nan"), dtype=metrics["loss"].dtype)
-
-            grad_norm = optax.global_norm(grads)
+            (_, (_, metrics)), grads = jax.value_and_grad(
+                total_objective,
+                argnums=0,
+                has_aux=True,
+            )(state.params, batch)
             state = state.apply_gradients(grads=grads)
             metrics = {
                 **metrics,
-                "grad_norm": grad_norm,
-                "grad_norm_real": grad_norm_real,
-                "grad_norm_phase": grad_norm_phase,
+                "grad_norm": optax.global_norm(grads),
                 "param_norm": optax.global_norm(state.params),
             }
             return state, metrics
@@ -1184,43 +808,12 @@ def main(cfg: Args) -> None:
         metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics_hist)
         return state, metrics, batch
 
-    timing_last_wall = None
-    timing_last_iter = None
-    timing_total_elapsed = 0.0
-    timing_total_outer_steps = 0
-    time_per_outer_iter = float("nan")
-    time_per_inner_ppo_step = float("nan")
-    time_per_outer_iter_recent = float("nan")
-    time_per_inner_ppo_step_recent = float("nan")
-
     eval_base_key = jax.random.PRNGKey(cfg.seed + 20_000)
 
     for it in range(cfg.n_iter):
         state, metrics, batch = train_iter(state)
 
         if it % cfg.log_every == 0:
-            if cfg.time_optimization_steps:
-                jax.block_until_ready(metrics["loss"])
-                now = time.perf_counter()
-                if timing_last_wall is not None and timing_last_iter is not None:
-                    elapsed = now - timing_last_wall
-                    outer_steps = max(it - timing_last_iter, 1)
-                    inner_steps = max(outer_steps * cfg.ppo_epochs, 1)
-                    timing_total_elapsed += elapsed
-                    timing_total_outer_steps += outer_steps
-                    time_per_outer_iter_recent = elapsed / outer_steps
-                    time_per_inner_ppo_step_recent = elapsed / inner_steps
-                    time_per_outer_iter = timing_total_elapsed / max(
-                        timing_total_outer_steps,
-                        1,
-                    )
-                    time_per_inner_ppo_step = timing_total_elapsed / max(
-                        timing_total_outer_steps * cfg.ppo_epochs,
-                        1,
-                    )
-                timing_last_wall = now
-                timing_last_iter = it
-
             current_lr = float(lr_schedule(state.step))
             msg = (
                 f"it={it:04d}  loss={float(metrics['loss']): .6f}  "
@@ -1239,20 +832,8 @@ def main(cfg: Args) -> None:
                 f"||g||={float(metrics['grad_norm']): .3e}  "
                 f"||θ||={float(metrics['param_norm']): .3e}"
             )
-            if cfg.use_phase_jacobian_baseline:
-                msg += (
-                    f"  ||g_real||={float(metrics['grad_norm_real']): .3e}"
-                    f"  ||g_phase||={float(metrics['grad_norm_phase']): .3e}"
-                )
             if cfg.reference_energy is not None:
                 msg += f"  rel_ref={float(metrics['rel_error_reference']): .3e}"
-            if cfg.time_optimization_steps:
-                msg += (
-                    f"  t/outer={time_per_outer_iter: .4f}s"
-                    f"  t/ppo={time_per_inner_ppo_step: .4f}s"
-                    f"  t/outer_recent={time_per_outer_iter_recent: .4f}s"
-                    f"  t/ppo_recent={time_per_inner_ppo_step_recent: .4f}s"
-                )
             print(msg)
 
             if cfg.wandb_mode != "disabled":
@@ -1261,35 +842,11 @@ def main(cfg: Args) -> None:
                     "lr": current_lr,
                     **{k: float(v) for k, v in metrics.items()},
                 }
-                if cfg.time_optimization_steps:
-                    log_dict.update({
-                        "time_per_outer_iter": time_per_outer_iter,
-                        "time_per_inner_ppo_step": time_per_inner_ppo_step,
-                        "time_per_outer_iter_recent": time_per_outer_iter_recent,
-                        "time_per_inner_ppo_step_recent": time_per_inner_ppo_step_recent,
-                    })
                 wandb.log(log_dict, step=it)
 
         if cfg.eval_every > 0 and (it % cfg.eval_every == 0 or it == cfg.n_iter - 1):
             eval_key = jax.random.fold_in(eval_base_key, it)
             eval_metrics = evaluate(state, eval_key)
-
-            if cfg.log_gradient_info:
-                grads_real = jax.grad(real_objective)(state.params, batch)
-                grads_phase = jax.grad(phase_objective)(state.params, batch)
-                if cfg.use_phase_jacobian_baseline:
-                    grads_phase = apply_phase_jacobian_baseline(
-                        state.params,
-                        batch,
-                        grads_phase,
-                    )
-                eval_metrics.update({
-                    "eval_grad_norm_real": float(optax.global_norm(grads_real)),
-                    "eval_grad_norm_phase": float(optax.global_norm(grads_phase)),
-                    "eval_grad_norm_components": float(
-                        jnp.sqrt(tree_l2_sq(grads_real) + tree_l2_sq(grads_phase))
-                    ),
-                })
 
             eval_msg = (
                 f"[eval] it={it:04d}  "
