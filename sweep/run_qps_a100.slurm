@@ -35,21 +35,31 @@ mkdir -p "$HOME/slurm_logs" logs/
 # Arguments
 SEED=${SLURM_ARRAY_TASK_ID}
 HAMILTONIAN=${1:-ising}
-RUN_NAME=${2:-qps_${HAMILTONIAN}_seed_${SEED}}
+
+# Scaling overrides — env vars with defaults that preserve existing behaviour
+N_SAMPLES=${N_SAMPLES:-1024}
+CHAIN_N=${CHAIN_N:-12}
+N_GRU_LAYERS=${N_GRU_LAYERS:-3}
+RNN_HIDDEN=${RNN_HIDDEN:-256}
+HEAD_HIDDEN=${HEAD_HIDDEN:-256}
+_DEFAULT_STEPS=$([ "$HAMILTONIAN" = "ising" ] && echo 20000 || echo 40000)
+TRANSITION_STEPS=${TRANSITION_STEPS:-$_DEFAULT_STEPS}
+WANDB_PROJECT=${WANDB_PROJECT:-hyperscalenqs}
+RUN_NAME=${2:-qps_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}}
 
 CMD="python src/qps.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
-    n_samples=1024 \
-    transition_steps=$([ "$HAMILTONIAN" = "ising" ] && echo 20000 || echo 40000) \
+    n_samples=${N_SAMPLES} \
+    transition_steps=${TRANSITION_STEPS} \
     lr_peak=1e-4 \
-    N=12 \
-    n_gru_layers=3 \
-    rnn_hidden=256 \
-    head_hidden=256 \
+    N=${CHAIN_N} \
+    n_gru_layers=${N_GRU_LAYERS} \
+    rnn_hidden=${RNN_HIDDEN} \
+    head_hidden=${HEAD_HIDDEN} \
     wandb_run_name=${RUN_NAME} \
     wandb_mode=online \
-    wandb_project=hyperscalenqs"
+    wandb_project=${WANDB_PROJECT}"
 
 echo "Executing: $CMD"
 eval $CMD
