@@ -7,17 +7,17 @@
 #
 # Usage: bash sweep/run_scaling_system.sh
 
-for N in 8 16 32; do
+for N in 8 16 24; do
     export CHAIN_N=$N
     export N_SAMPLES=2048
     export N_GRU_LAYERS=3
     export RNN_HIDDEN=256
     export HEAD_HIDDEN=256
     export TRANSITION_STEPS=40000
-    export WANDB_PROJECT=hyperscalenqs-scaling-system
+    export WANDB_PROJECT=scaling-system
     export RUN_TAG=N${N}
 
-    sbatch sweep/run_adam_a100.slurm j1j2
-    sbatch sweep/run_minsr_a100.slurm j1j2 minsr
-    sbatch sweep/run_qps_a100.slurm j1j2
+    sbatch sweep/1d/run_adam.slurm j1j2
+    sbatch sweep/1d/run_minsr.slurm j1j2 minsr
+    sbatch sweep/1d/run_qps.slurm j1j2
 done

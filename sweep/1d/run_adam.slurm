@@ -47,7 +47,7 @@ TRANSITION_STEPS=${TRANSITION_STEPS:-$_DEFAULT_STEPS}
 WANDB_PROJECT=${WANDB_PROJECT:-hyperscalenqs}
 RUN_NAME=${2:-adam_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}}
 
-CMD="python src/adam.py \
+CMD="python src/1d/adam.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
     n_samples=${N_SAMPLES} \

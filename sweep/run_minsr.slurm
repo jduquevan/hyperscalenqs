@@ -32,7 +32,7 @@ SEED=${1}
 RUN_NAME=${2:-minsr_seed_${SEED}}
 
 # Construct the full command
-CMD="python src/minsr.py seed=${SEED} wandb_run_name=${RUN_NAME}"
+CMD="python src/1d/minsr.py seed=${SEED} wandb_run_name=${RUN_NAME}"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"

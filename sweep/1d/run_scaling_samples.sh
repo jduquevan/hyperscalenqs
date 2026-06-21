@@ -14,10 +14,10 @@ for S in 512 1024 2048; do
     export RNN_HIDDEN=256
     export HEAD_HIDDEN=256
     export TRANSITION_STEPS=40000
-    export WANDB_PROJECT=hyperscalenqs-scaling-samples
+    export WANDB_PROJECT=scaling-samples
     export RUN_TAG=n${S}
 
-    sbatch sweep/run_adam_a100.slurm j1j2
-    sbatch sweep/run_minsr_a100.slurm j1j2 minsr
-    sbatch sweep/run_qps_a100.slurm j1j2
+    sbatch sweep/1d/run_adam.slurm j1j2
+    sbatch sweep/1d/run_minsr.slurm j1j2 minsr
+    sbatch sweep/1d/run_qps.slurm j1j2
 done
