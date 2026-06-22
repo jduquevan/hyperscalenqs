@@ -380,17 +380,59 @@ on the outer-iteration timescale.
 class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
     """VMC with Proximal Wavefunction Optimization (PWO) for energy minimization.
 
-    Dual-channel extension of PPO to complex-valued NQS:
+    PWO is a dual-channel extension of PPO to complex-valued NQS that
+    separately treats amplitude and phase updates.
+
+    At the start of each PWO epoch (every is_steps outer optimizer steps):
+      - Resamples a fresh batch from the current |ψ|²
+      - Freezes log_old = log ψ_old(σ) and E_loc under θ_old
+
+    Each outer optimizer step within the epoch computes two clipped losses:
 
     Real channel (probability ratio):
-        r_R = exp(2·(Re_new − Re_old))
-        L_R = mean[ max(r_R·A_R, clip(r_R, 1−ε, 1+ε)·A_R) ]
+        log_r = clip(2 · (Re_new − Re_old), −20, 20)
+        r_R   = exp(log_r)
+        A_R   = Re(E_loc) − mean(Re(E_loc))    [optionally normalized by std]
+        L_R   = mean[ max(r_R · A_R,  clip(r_R, 1−ε, 1+ε) · A_R) ]
 
     Imaginary channel (circular phase delta):
-        delta = atan2(sin(φ_new − φ_old), cos(φ_new − φ_old))
-        L_I = mean[ clip(delta, −i_clip_eps, i_clip_eps) · A_I ]
+        delta = 2 · atan2(sin(φ_new − φ_old), cos(φ_new − φ_old))
+        A_I   = Im(E_loc)    [optionally centered and normalized by std]
+        L_I   = mean[ r_sg · max(delta · A_I,  clip(delta, −i_clip_eps, i_clip_eps) · A_I) ]
 
     Total: L_PWO = L_R + L_I
+
+    Both channels share a single normalization flag: when normalize_advantage
+    is True, each advantage vector is divided by its standard deviation.
+
+    **Autoregressive vs. non-autoregressive models:**
+
+    For autoregressive models (subclasses of ``nk.models.AbstractARNN``),
+    samples are drawn exactly from |ψ_old|², so the raw ratio r is a proper
+    probability ratio and is used directly.
+
+    For non-autoregressive models (e.g. RBM, feedforward), MCMC samples come
+    from a Markov chain targeting |ψ_old|² but the log-wavefunction is defined
+    only up to a normalization constant.  Self-normalized importance sampling
+    (SNIS) corrects for this by replacing r with
+
+        r̃_i = r_i / mean_j(r_j)
+
+    so that the effective weights always have unit mean.  The normalization
+    denominator is treated as a constant (stop-gradient) to avoid introducing
+    second-order gradient terms.
+
+    Args:
+        hamiltonian: NetKet Hamiltonian operator
+        optimizer: NetKet-compatible (optax) optimizer
+        variational_state: MCState variational state
+        is_steps: inner gradient steps per PWO epoch K (default 4)
+        r_clip_eps: PPO clipping range ε for the real (amplitude) channel
+            (default 0.2)
+        i_clip_eps: clipping range for the circular phase delta in the
+            imaginary channel (default 0.2)
+        normalize_advantage: divide both advantages by their std (default True)
+        center_imag_advantage: subtract mean of Im(E_loc) (default True)
     """
 
     def __init__(
@@ -399,7 +441,7 @@ class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
         optimizer,
         variational_state: nk.vqs.MCState,
         *,
-        n_ppo_steps: int = 4,
+        is_steps: int = 4,
         r_clip_eps: float = 0.2,
         i_clip_eps: float = 0.2,
         normalize_advantage: bool = True,
@@ -407,22 +449,24 @@ class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
     ):
         if not isinstance(variational_state, nk.vqs.MCState):
             raise ValueError(
-                "ProximalWavefunctionOptimization requires an MCState; "
+                "ProximalWavefunctionOptimization requires an MCState variational state; "
                 f"got {type(variational_state).__name__!r}."
             )
+
         super().__init__(variational_state, optimizer, minimized_quantity_name="Energy")
 
         self._ha = hamiltonian
-        self._n_ppo_steps = n_ppo_steps
+        self._is_steps = is_steps
         self._r_clip_eps = r_clip_eps
         self._i_clip_eps = i_clip_eps
         self._normalize_advantage = normalize_advantage
         self._center_imag_advantage = center_imag_advantage
 
-        self._batch   = None
-        self._log_old = None
-        self._adv_R   = None
-        self._adv_I   = None
+        # Epoch-level cache — populated at epoch start, reused for K inner steps
+        self._batch: jnp.ndarray | None = None
+        self._log_old: jnp.ndarray | None = None
+        self._adv_R: jnp.ndarray | None = None  # Re(E_loc) − mean
+        self._adv_I: jnp.ndarray | None = None  # Im(E_loc) - mean (but mean is zero)
 
         model = variational_state.model
         is_autoregressive = isinstance(model, nk.models.AbstractARNN)
@@ -433,30 +477,23 @@ class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
             def loss_fn(p):
                 log_new = model.apply({"params": p}, batch)
 
-                # Real channel
-                log_ratio = jnp.clip(
-                    2 * (jnp.real(log_new) - jnp.real(log_old)), -20.0, 20.0
-                )
+                # --- Real channel: amplitude ratio ---
+                log_ratio = 2 * (jnp.real(log_new) - jnp.real(log_old))
+                log_ratio = jnp.clip(log_ratio, -20.0, 20.0)
                 ratio = jnp.exp(log_ratio)
-
                 if not is_autoregressive:
-                    # SNIS correction: normalize IS weights to unit mean so that
-                    # the loss is invariant to the overall wavefunction scale.
+                    # Self-normalized importance sampling for non-autoregressive models
                     ratio = ratio / jax.lax.stop_gradient(jnp.mean(ratio))
 
-                ratio_clipped = jnp.clip(ratio, 1 - r_clip_eps, 1 + r_clip_eps)
-                loss_R = jnp.mean(jnp.maximum(ratio * adv_R, ratio_clipped * adv_R))
+                ratio_clip = jnp.clip(ratio, 1 - r_clip_eps, 1 + r_clip_eps)
+                loss_R = jnp.mean(jnp.maximum(ratio * adv_R, ratio_clip * adv_R))
 
-                # Imaginary channel
-                sg_ratio   = jax.lax.stop_gradient(ratio)
-                raw_delta  = jnp.imag(log_new) - jnp.imag(log_old)
-                delta      = 2 * jnp.atan2(jnp.sin(raw_delta), jnp.cos(raw_delta))
-                delta_clipped = jnp.clip(delta, -i_clip_eps, i_clip_eps)
-                loss_I = jnp.mean(
-                    jnp.maximum(
-                        sg_ratio * delta * adv_I, sg_ratio * delta_clipped * adv_I
-                    )
-                )
+                # --- Imaginary channel ---
+                sg_ratio = jax.lax.stop_gradient(ratio)
+                raw_dif = jnp.imag(log_new) - jnp.imag(log_old)
+                dif = 2 * jnp.atan2(jnp.sin(raw_dif), jnp.cos(raw_dif))
+                dif_clip = jnp.clip(dif, -i_clip_eps, i_clip_eps)
+                loss_I = jnp.mean(sg_ratio * jnp.maximum(dif * adv_I, dif_clip * adv_I))
 
                 return loss_R + loss_I
 
@@ -467,9 +504,9 @@ class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
     def _epoch_start(self) -> None:
         """Resample batch and freeze E_loc and log_old under current params."""
         self.state.reset()
-        self._batch   = self.state.samples.reshape(-1, self.state.hilbert.size)
+        self._batch = self.state.samples.reshape(-1, self.state.hilbert.size)
         self._log_old = jax.lax.stop_gradient(self.state.log_value(self._batch))
-        e_loc_chains  = jax.lax.stop_gradient(self.state.local_estimators(self._ha))
+        e_loc_chains = jax.lax.stop_gradient(self.state.local_estimators(self._ha))
         self._loss_stats = nk.stats.statistics(e_loc_chains)
         e_loc = e_loc_chains.reshape(-1)
 
@@ -477,12 +514,13 @@ class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
         self._adv_I = jnp.imag(e_loc)
         if self._center_imag_advantage:
             self._adv_I = self._adv_I - jnp.mean(self._adv_I)
+
         if self._normalize_advantage:
             self._adv_R = self._adv_R / (jnp.std(self._adv_R) + 1e-8)
             self._adv_I = self._adv_I / (jnp.std(self._adv_I) + 1e-8)
 
     def _forward_and_backward(self):
-        if self._batch is None or self.step_count % self._n_ppo_steps == 0:
+        if self._batch is None or self.step_count % self._is_steps == 0:
             self._epoch_start()
 
         pwo_loss, grads = self._pwo_cost_and_grad(
@@ -493,6 +531,7 @@ class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
             self._adv_I,
         )
         self._pwo_loss = pwo_loss
+
         return grads
 
     def _log_additional_data(self, log_dict: dict, step: int) -> None:  # noqa: ARG002
