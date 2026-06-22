@@ -1,0 +1,669 @@
+---
+title: "VMC, VMC-SR, and PWO on the J₁-J₂ Chain"
+subtitle: "ComplexRecurrentAR autoregressive wavefunction · *N* = 12 spins · critical point J₂/J₁ = 0.5"
+author: "nqslab tutorial"
+date: today
+format:
+  html:
+    code-fold: false
+    embed-resources: true
+    toc: true
+    number-sections: true
+execute:
+  warning: false
+jupyter: python3
+---
+
+## Introduction
+
+The frustrated one-dimensional J₁-J₂ Heisenberg model is a benchmark for
+variational methods in quantum many-body physics:
+
+$$
+H = J_1 \sum_{\langle i,j \rangle} \mathbf{S}_i \cdot \mathbf{S}_j
+  + J_2 \sum_{\langle\langle i,j \rangle\rangle} \mathbf{S}_i \cdot \mathbf{S}_j
+$$
+
+At $J_2/J_1 = 0.5$ the system sits at the Majumdar–Ghosh point, where the
+spectral gap closes and quantum fluctuations are large — making accurate
+variational optimisation challenging.
+
+We benchmark three drivers, all using the same **ComplexRecurrentAR**
+autoregressive ansatz ($N = 12$ sites, $N_s = 1024$ samples per step):
+
+| Method | Driver | Optimiser | Gradient type |
+|--------|--------|-----------|---------------|
+| VMC | `nk.driver.VMC` | Adam | Plain stochastic |
+| VMC-SR | `nk.driver.VMC_SR` | SGD | Natural gradient (SR) |
+| PWO | `ProximalWavefunctionOptimization` | Adam | Clipped PPO-style |
+
+Two convergence metrics are tracked throughout training:
+
+- **Relative energy error** $\varepsilon = \lvert E - E_{\rm ED} \rvert / \lvert E_{\rm ED} \rvert$
+- **V-score** $V = N \operatorname{Var}(H) / E^2$ — a dimensionless proxy for
+  proximity to the ground state (Nomura *et al.* 2021)
+
+Both are computed from the MC energy statistics logged at each optimiser step.
+
+---
+
+## Setup
+
+### Imports
+
+```{python}
+#| label: imports
+
+import jax
+import jax.numpy as jnp
+import math
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import netket as nk
+import optax
+from flax import linen as nn
+```
+
+### Hyperparameters
+
+```{python}
+#| label: parameters
+
+# ── System ──────────────────────────────────────────────────────────────────
+N       = 12       # chain length
+J1, J2  = 1.0, 0.5 # Majumdar–Ghosh critical point (J2/J1 = 0.5)
+
+# ── ComplexRecurrentAR architecture ─────────────────────────────────────────
+EMBED_DIM    = 32
+RNN_HIDDEN   = 256
+HEAD_HIDDEN  = 256
+N_GRU_LAYERS = 3
+
+# ── Sampling ─────────────────────────────────────────────────────────────────
+N_SAMPLES = 1024
+
+# ── Training ──────────────────────────────────────────────────────────────────
+MAX_TRAIN_TIME = 300.0  # wall-clock seconds per method
+
+# ── Optimizer hyperparameters (J₁-J₂, Table A3) ──────────────────────────────
+# Adam + cosine one-cycle schedule
+ADAM_LR_PEAK        = 3e-4
+ADAM_TRANS_STEPS    = 10_000
+
+# PWO + cosine one-cycle (horizon = trans_steps × PPO_EPOCHS)
+PWO_LR_PEAK         = 1e-4
+PWO_TRANS_STEPS     = 40_000
+PPO_EPOCHS          = 4
+PPO_CLIP_EPS        = 1e-3   # real-channel clipping ε_r
+PHASE_CLIP          = 0.3    # imaginary-channel clipping ε_i
+
+# Shared one-cycle schedule shape
+LR_DIV_FACTOR       = 10.0   # init_lr  = peak / div_factor
+LR_FINAL_DIV_FACTOR = 200.0  # final_lr = init_lr / final_div_factor
+LR_PCT_START        = 0.15   # fraction of horizon used for warm-up
+
+# minSR + SGD (NTK formulation, constant lr)
+SR_LR         = 1e-3
+SR_DIAG_SHIFT = 1e-2
+
+# ── Reproducibility (one seed per method) ────────────────────────────────────
+SEEDS = [42, 43, 44]  # VMC, minSR, PWO
+```
+
+---
+
+## Hamiltonian and Exact Ground State
+
+### Building the J₁-J₂ Hamiltonian
+
+`nk.graph.Chain` with `max_neighbor_order=2` automatically assigns colour 0
+to NN edges and colour 1 to NNN edges, so no manual graph construction is
+needed.
+
+```{python}
+#| label: hamiltonian
+
+hi    = nk.hilbert.Spin(s=1/2, N=N)
+graph = nk.graph.Chain(length=N, pbc=True, max_neighbor_order=2)
+ha    = nk.operator.Heisenberg(hi, graph=graph, J=[J1, J2], sign_rule=[False, False])
+```
+
+### Exact Diagonalisation
+
+```{python}
+#| label: exact-energy
+
+def get_exact_ground_state(H, compute_eigenvectors=False, method="lanczos"):
+    """Compute the exact ground-state energy (and optionally wavefunction)."""
+    if method == "lanczos":
+        result = nk.exact.lanczos_ed(H, k=1, compute_eigenvectors=compute_eigenvectors)
+    elif method == "full":
+        result = nk.exact.full_ed(H, compute_eigenvectors=compute_eigenvectors)
+    else:
+        raise ValueError(f"Unknown method {method!r}. Choose 'lanczos' or 'full'.")
+
+    if compute_eigenvectors:
+        evals, evecs = result
+        return float(evals[0]), evecs[:, 0]
+    return float(result[0]), None
+
+
+E_exact, _ = get_exact_ground_state(ha, method="lanczos")
+print(f"Exact ground-state energy  E₀     = {E_exact:.8f}")
+print(f"Energy per site            E₀/N   = {E_exact / N:.8f}")
+```
+
+---
+
+## Variational State Factory
+
+**ComplexRecurrentAR** is a single-backbone autoregressive NQS. A shared
+GRU trunk (with residual connections between layers) processes the causal
+token sequence; two MLP towers branch off to produce amplitude logits and
+phase values simultaneously for each site:
+
+- **Amplitude tower** — `log_softmax` over local spin values, normalised to
+  give $\log p(\sigma_i|\sigma_{<i})$; real part of `conditionals_log_psi`.
+- **Phase tower** — per-site phase contributions whose sum (accumulated by
+  `AbstractARNN.__call__`) gives the total phase $\varphi(\boldsymbol\sigma)$;
+  imaginary part.
+
+The full ansatz is $\log\psi(\boldsymbol\sigma) = \log|\psi| + i\,\varphi$ with
+exact normalisation enforced by the amplitude tower. `ARDirectSampler` samples
+from $|\psi|^2$ using only the real part of `conditionals_log_psi`.
+
+```{python}
+#| label: model
+
+class GRULayer(nn.Module):
+    hidden_size: int
+    param_dtype: any = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        B, T, _ = x.shape
+        cell = nn.GRUCell(
+            features=self.hidden_size,
+            param_dtype=self.param_dtype,
+            name="cell",
+        )
+        carry = jnp.zeros((B, self.hidden_size), dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            carry, y = cell(carry, x[:, t, :])
+            ys.append(y)
+        return jnp.stack(ys, axis=1)
+
+
+class ComplexRecurrentAR(nk.models.AbstractARNN):
+    """Single-backbone autoregressive NQS with shared GRU trunk.
+
+    conditionals_log_psi returns complex per-site values:
+      real part  = normalised log conditional amplitude (used by ARDirectSampler)
+      imag part  = per-site phase (summed by AbstractARNN.__call__ -> total log psi)
+    """
+
+    hilbert: object
+    embed_dim: int = 32
+    rnn_hidden: int = 128
+    head_hidden: int = 128
+    n_gru_layers: int = 2
+    use_site_embedding: bool = True
+    machine_pow: int = 2
+    phase_scale: float = math.pi
+    phase_init_std: float = 1e-3
+    param_dtype: any = jnp.float32
+
+    @nn.compact
+    def conditionals_log_psi(self, inputs: jax.Array) -> jax.Array:
+        if inputs.ndim == 1:
+            inputs = inputs[None, :]
+
+        B, N = inputs.shape
+
+        # Map spins {-1, +1} -> tokens {0, 1}; BOS token = 2
+        spin_tokens = (inputs > 0).astype(jnp.int32)
+        bos_token   = jnp.full((B, 1), 2, dtype=jnp.int32)
+        prev_tokens = jnp.concatenate([bos_token, spin_tokens[:, :-1]], axis=1)
+
+        x = nn.Embed(num_embeddings=3, features=self.embed_dim, name="tok_emb",
+                     param_dtype=self.param_dtype)(prev_tokens)
+        if self.use_site_embedding:
+            pos_ids = jnp.arange(N, dtype=jnp.int32)[None, :]
+            x = x + nn.Embed(num_embeddings=N, features=self.embed_dim, name="pos_emb",
+                              param_dtype=self.param_dtype)(pos_ids)
+
+        x = nn.Dense(self.rnn_hidden, name="input_proj", param_dtype=self.param_dtype)(x)
+        x = nn.tanh(x)
+        x = nn.LayerNorm(name="input_ln", param_dtype=self.param_dtype)(x)
+
+        for i in range(self.n_gru_layers):
+            h = GRULayer(hidden_size=self.rnn_hidden, name=f"gru_{i}",
+                         param_dtype=self.param_dtype)(x)
+            x = x + h
+
+        # Amplitude tower
+        x_amp = nn.Dense(self.head_hidden, name="amp_fc1", param_dtype=self.param_dtype)(x)
+        x_amp = nn.gelu(x_amp)
+        x_amp = nn.Dense(self.head_hidden, name="amp_fc2", param_dtype=self.param_dtype)(x_amp)
+        x_amp = nn.gelu(x_amp)
+        amp_logpsi = jax.nn.log_softmax(
+            nn.Dense(self.hilbert.local_size, name="amp_head",
+                     param_dtype=self.param_dtype)(x_amp), axis=-1
+        ) / float(self.machine_pow)
+
+        # Phase tower
+        x_phase = nn.Dense(self.head_hidden, name="phase_fc1", param_dtype=self.param_dtype)(x)
+        x_phase = nn.gelu(x_phase)
+        x_phase = nn.Dense(self.head_hidden, name="phase_fc2", param_dtype=self.param_dtype)(x_phase)
+        x_phase = nn.gelu(x_phase)
+        phase_raw = nn.Dense(
+            self.hilbert.local_size,
+            name="phase_head",
+            param_dtype=self.param_dtype,
+            kernel_init=nn.initializers.normal(stddev=self.phase_init_std),
+            bias_init=nn.initializers.zeros_init(),
+        )(x_phase)
+        phase_raw = phase_raw - jnp.mean(phase_raw, axis=-1, keepdims=True)
+        phase     = self.phase_scale * jnp.tanh(phase_raw)
+
+        return amp_logpsi + 1j * phase
+```
+
+```{python}
+#| label: make-vstate
+
+def make_vstate(seed: int) -> nk.vqs.MCState:
+    """Return an MCState backed by ComplexRecurrentAR + ARDirectSampler."""
+    model   = ComplexRecurrentAR(
+        hilbert=hi,
+        embed_dim=EMBED_DIM,
+        rnn_hidden=RNN_HIDDEN,
+        head_hidden=HEAD_HIDDEN,
+        n_gru_layers=N_GRU_LAYERS,
+    )
+    sampler = nk.sampler.ARDirectSampler(hi)
+    return nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES, seed=seed)
+```
+
+---
+
+## Training
+
+A thin wrapper runs each driver and collects the `RuntimeLog`:
+
+```{python}
+#| label: train-helper
+
+def train(driver, max_time: float = MAX_TRAIN_TIME) -> dict:
+    """Run driver until max_time wall-clock seconds have elapsed."""
+    log = nk.logging.RuntimeLog()
+    t0  = time.monotonic()
+
+    def _timeout(step, log_data, driver):
+        return (time.monotonic() - t0) < max_time
+
+    driver.run(int(1e9), out=log, callback=_timeout, show_progress=False)
+    elapsed = time.monotonic() - t0
+    print(f"  {driver.step_count} steps in {elapsed:.1f}s")
+    return log.data
+```
+
+### Adam
+
+Plain energy minimisation with a cosine one-cycle learning-rate schedule.
+
+```{python}
+#| label: run-vmc
+
+state_vmc = make_vstate(SEEDS[0])
+lr_vmc    = optax.schedules.cosine_onecycle_schedule(
+    transition_steps=ADAM_TRANS_STEPS,
+    peak_value=ADAM_LR_PEAK,
+    pct_start=LR_PCT_START,
+    div_factor=LR_DIV_FACTOR,
+    final_div_factor=LR_FINAL_DIV_FACTOR,
+)
+vmc = nk.driver.VMC(ha, optax.adam(lr_vmc), variational_state=state_vmc)
+
+print("Training Adam …")
+data_vmc = train(vmc)
+print("Done.")
+```
+
+### minSR + SGD
+
+minSR reformulates stochastic reconfiguration as an $M\times M$ linear solve
+(where $M$ is the sample count) instead of the usual $P\times P$ solve, making
+it tractable for large networks. `use_ntk=True` activates this NTK formulation;
+`on_the_fly=True` avoids materialising the full Jacobian.
+
+```{python}
+#| label: run-vmc-sr
+
+state_sr = make_vstate(SEEDS[1])
+vmc_sr = nk.driver.VMC_SR(
+    ha,
+    nk.optimizer.Sgd(learning_rate=SR_LR),
+    variational_state=state_sr,
+    diag_shift=SR_DIAG_SHIFT,
+    use_ntk=True,
+    on_the_fly=True,
+)
+
+print("Training minSR + SGD …")
+data_sr = train(vmc_sr)
+print("Done.")
+```
+
+### PWO + Adam
+
+**Proximal Wavefunction Optimization** extends the PPO clipping idea to
+complex-valued NQS via two independent channels:
+
+- *Real channel* — clips the probability ratio
+  $r = \exp\!\bigl(2(\operatorname{Re}\log\psi_{\rm new} - \operatorname{Re}\log\psi_{\rm old})\bigr)$
+  to $[1-\varepsilon_r,\,1+\varepsilon_r]$.
+- *Imaginary channel* — clips the circular phase delta
+  $\delta = 2\arctan(\sin\Delta\varphi/\cos\Delta\varphi)$
+  to $[-\varepsilon_i,\,+\varepsilon_i]$.
+
+Every `n_ppo_steps` optimiser steps a fresh batch is drawn and $E_{\rm loc}$
+is recomputed under the current parameters. The learning-rate schedule is a
+cosine one-cycle whose horizon is scaled by `PPO_EPOCHS` so that it evolves
+on the outer-iteration timescale.
+
+```{python}
+#| label: pwo-driver
+
+class ProximalWavefunctionOptimization(nk.driver.AbstractVariationalDriver):
+    """VMC with Proximal Wavefunction Optimization (PWO) for energy minimization.
+
+    Dual-channel extension of PPO to complex-valued NQS:
+
+    Real channel (probability ratio):
+        r_R = exp(2·(Re_new − Re_old))
+        L_R = mean[ max(r_R·A_R, clip(r_R, 1−ε, 1+ε)·A_R) ]
+
+    Imaginary channel (circular phase delta):
+        delta = atan2(sin(φ_new − φ_old), cos(φ_new − φ_old))
+        L_I = mean[ clip(delta, −i_clip_eps, i_clip_eps) · A_I ]
+
+    Total: L_PWO = L_R + L_I
+    """
+
+    def __init__(
+        self,
+        hamiltonian,
+        optimizer,
+        variational_state: nk.vqs.MCState,
+        *,
+        n_ppo_steps: int = 4,
+        r_clip_eps: float = 0.2,
+        i_clip_eps: float = 0.2,
+        normalize_advantage: bool = True,
+        center_imag_advantage: bool = True,
+    ):
+        if not isinstance(variational_state, nk.vqs.MCState):
+            raise ValueError(
+                "ProximalWavefunctionOptimization requires an MCState; "
+                f"got {type(variational_state).__name__!r}."
+            )
+        super().__init__(variational_state, optimizer, minimized_quantity_name="Energy")
+
+        self._ha = hamiltonian
+        self._n_ppo_steps = n_ppo_steps
+        self._r_clip_eps = r_clip_eps
+        self._i_clip_eps = i_clip_eps
+        self._normalize_advantage = normalize_advantage
+        self._center_imag_advantage = center_imag_advantage
+
+        self._batch   = None
+        self._log_old = None
+        self._adv_R   = None
+        self._adv_I   = None
+
+        model = variational_state.model
+        is_autoregressive = isinstance(model, nk.models.AbstractARNN)
+        self._is_autoregressive = is_autoregressive
+
+        @jax.jit
+        def _pwo_cost_and_grad(params, batch, log_old, adv_R, adv_I):
+            def loss_fn(p):
+                log_new = model.apply({"params": p}, batch)
+
+                # Real channel
+                log_ratio = jnp.clip(
+                    2 * (jnp.real(log_new) - jnp.real(log_old)), -20.0, 20.0
+                )
+                ratio = jnp.exp(log_ratio)
+
+                if not is_autoregressive:
+                    # SNIS correction: normalize IS weights to unit mean so that
+                    # the loss is invariant to the overall wavefunction scale.
+                    ratio = ratio / jax.lax.stop_gradient(jnp.mean(ratio))
+
+                ratio_clipped = jnp.clip(ratio, 1 - r_clip_eps, 1 + r_clip_eps)
+                loss_R = jnp.mean(jnp.maximum(ratio * adv_R, ratio_clipped * adv_R))
+
+                # Imaginary channel
+                sg_ratio   = jax.lax.stop_gradient(ratio)
+                raw_delta  = jnp.imag(log_new) - jnp.imag(log_old)
+                delta      = 2 * jnp.atan2(jnp.sin(raw_delta), jnp.cos(raw_delta))
+                delta_clipped = jnp.clip(delta, -i_clip_eps, i_clip_eps)
+                loss_I = jnp.mean(
+                    jnp.maximum(
+                        sg_ratio * delta * adv_I, sg_ratio * delta_clipped * adv_I
+                    )
+                )
+
+                return loss_R + loss_I
+
+            return jax.value_and_grad(loss_fn)(params)
+
+        self._pwo_cost_and_grad = _pwo_cost_and_grad
+
+    def _epoch_start(self) -> None:
+        """Resample batch and freeze E_loc and log_old under current params."""
+        self.state.reset()
+        self._batch   = self.state.samples.reshape(-1, self.state.hilbert.size)
+        self._log_old = jax.lax.stop_gradient(self.state.log_value(self._batch))
+        e_loc_chains  = jax.lax.stop_gradient(self.state.local_estimators(self._ha))
+        self._loss_stats = nk.stats.statistics(e_loc_chains)
+        e_loc = e_loc_chains.reshape(-1)
+
+        self._adv_R = jnp.real(e_loc) - jnp.mean(jnp.real(e_loc))
+        self._adv_I = jnp.imag(e_loc)
+        if self._center_imag_advantage:
+            self._adv_I = self._adv_I - jnp.mean(self._adv_I)
+        if self._normalize_advantage:
+            self._adv_R = self._adv_R / (jnp.std(self._adv_R) + 1e-8)
+            self._adv_I = self._adv_I / (jnp.std(self._adv_I) + 1e-8)
+
+    def _forward_and_backward(self):
+        if self._batch is None or self.step_count % self._n_ppo_steps == 0:
+            self._epoch_start()
+
+        pwo_loss, grads = self._pwo_cost_and_grad(
+            self.state.parameters,
+            self._batch,
+            self._log_old,
+            self._adv_R,
+            self._adv_I,
+        )
+        self._pwo_loss = pwo_loss
+        return grads
+
+    def _log_additional_data(self, log_dict: dict, step: int) -> None:  # noqa: ARG002
+        log_dict["PWO_loss"] = self._pwo_loss
+```
+
+```{python}
+#| label: run-pwo
+
+state_pwo = make_vstate(SEEDS[2])
+lr_pwo    = optax.schedules.cosine_onecycle_schedule(
+    transition_steps=PWO_TRANS_STEPS * PPO_EPOCHS,
+    peak_value=PWO_LR_PEAK,
+    pct_start=LR_PCT_START,
+    div_factor=LR_DIV_FACTOR,
+    final_div_factor=LR_FINAL_DIV_FACTOR,
+)
+pwo = ProximalWavefunctionOptimization(
+    ha,
+    optax.adam(lr_pwo),
+    variational_state=state_pwo,
+    n_ppo_steps=PPO_EPOCHS,
+    r_clip_eps=PPO_CLIP_EPS,
+    i_clip_eps=PHASE_CLIP,
+    normalize_advantage=True,
+    center_imag_advantage=True,
+)
+
+print("Training PWO + Adam …")
+data_pwo = train(pwo)
+print("Done.")
+```
+
+---
+
+## Results
+
+### Metric Computation
+
+```{python}
+#| label: metrics
+
+def extract_energy(log_data: dict, key: str = "Energy"):
+    """Pull real energy mean and variance arrays from a RuntimeLog data dict."""
+    E   = np.real(np.array(log_data[key]["Mean"]))
+    Var = np.real(np.array(log_data[key]["Variance"]))
+    return E, Var
+
+
+def relative_error(E: np.ndarray, E_ref: float) -> np.ndarray:
+    """Relative energy error |E − E_ref| / |E_ref|."""
+    return np.abs(E - E_ref) / np.abs(E_ref)
+
+
+def compute_vscore(E: np.ndarray, Var: np.ndarray, n_sites: int) -> np.ndarray:
+    """V-score = N · Var(H) / E²   (Nomura et al. 2021)."""
+    return n_sites * Var / E**2
+
+
+# ── VMC ──────────────────────────────────────────────────────────────────────
+E_vmc,  Var_vmc  = extract_energy(data_vmc)
+err_vmc = relative_error(E_vmc, E_exact)
+vsc_vmc = compute_vscore(E_vmc, Var_vmc, N)
+
+# ── VMC-SR ───────────────────────────────────────────────────────────────────
+E_sr,   Var_sr   = extract_energy(data_sr)
+err_sr  = relative_error(E_sr,  E_exact)
+vsc_sr  = compute_vscore(E_sr,  Var_sr,  N)
+
+# ── PWO ──────────────────────────────────────────────────────────────────────
+E_pwo,  Var_pwo  = extract_energy(data_pwo)
+err_pwo = relative_error(E_pwo, E_exact)
+vsc_pwo = compute_vscore(E_pwo, Var_pwo, N)
+```
+
+### Convergence Plot
+
+```{python}
+#| label: fig-comparison
+#| fig-cap: |
+#|   Energy convergence on the 12-site periodic J₁-J₂ chain at the critical
+#|   point. Both axes are logarithmic. The PWO curve updates its energy
+#|   estimate every `n_ppo_steps = 4` steps, so values are piecewise constant
+#|   within each PPO epoch.
+
+PALETTE = {
+    "Adam":        "#1f77b4",
+    "minSR + SGD": "#ff7f0e",
+    "PWO + Adam":  "#2ca02c",
+}
+
+curves = {
+    "Adam":        (err_vmc, vsc_vmc),
+    "minSR + SGD": (err_sr,  vsc_sr),
+    "PWO + Adam":  (err_pwo, vsc_pwo),
+}
+
+fig, (ax_err, ax_vs) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+for label, (err, vsc) in curves.items():
+    c     = PALETTE[label]
+    steps = np.arange(1, len(err) + 1)
+    ax_err.semilogy(steps, err, label=label, color=c, linewidth=1.5)
+    ax_vs.semilogy( steps, vsc, label=label, color=c, linewidth=1.5)
+
+# ── Left panel ────────────────────────────────────────────────────────────────
+ax_err.set_xlabel("Iteration")
+ax_err.set_ylabel(r"$\varepsilon = |E - E_{\mathrm{ED}}|\,/\,|E_{\mathrm{ED}}|$")
+ax_err.set_title("Relative Energy Error")
+ax_err.legend(framealpha=0.8)
+ax_err.grid(True, which="both", alpha=0.3)
+
+# ── Right panel ───────────────────────────────────────────────────────────────
+ax_vs.set_xlabel("Iteration")
+ax_vs.set_ylabel(r"$V = N\,\mathrm{Var}(H)\,/\,E^2$")
+ax_vs.set_title("V-score")
+ax_vs.legend(framealpha=0.8)
+ax_vs.grid(True, which="both", alpha=0.3)
+
+fig.suptitle(
+    rf"J₁-J₂ chain,  $N = {N}$,  $J_2/J_1 = {J2/J1:.1f}$  (Majumdar–Ghosh point)",
+    fontsize=12,
+)
+fig.tight_layout()
+plt.show()
+```
+
+### Summary Table
+
+```{python}
+#| label: summary-table
+
+header = f"{'Method':<16}  {'Final ε':>12}  {'Final V-score':>14}"
+sep    = "-" * len(header)
+print(header)
+print(sep)
+for label, (err, vsc) in curves.items():
+    print(f"{label:<16}  {err[-1]:>12.3e}  {vsc[-1]:>14.3e}")
+print(sep)
+print(f"\nExact energy:  E₀ = {E_exact:.6f}  (E₀/N = {E_exact/N:.6f})")
+```
+
+---
+
+## Discussion
+
+**Adam** provides the simplest baseline: the energy gradient is computed
+directly from the local estimators and passed to Adam. Near the critical point,
+large fluctuations in $E_{\rm loc}$ can make the gradient noisy, slowing
+convergence.
+
+**VMC-SR + SGD** introduces the quantum geometric tensor as a preconditioner.
+The natural gradient is metric-invariant, which typically reduces the number
+of steps to convergence, especially when the Fisher information matrix is
+ill-conditioned. The trade-off is the $\mathcal{O}(N_s \times N_p)$ memory
+cost of the Jacobian needed to assemble $S$.
+
+**PWO + Adam** replaces the energy gradient with a clipped PPO-style
+objective. By bounding both the probability-ratio update (real channel) and
+the phase-delta update (imaginary channel), large parameter steps are
+penalised. The inner loop reuses a frozen batch for `n_ppo_steps = 4`
+gradient steps before resampling, increasing sample efficiency at the cost of
+a controlled bias. Because the energy estimate is frozen within each PPO
+epoch, the logged curve is piecewise constant at the resolution of
+`n_ppo_steps`.
+
+### Tuning Hints
+
+| Hyperparameter | Effect |
+|----------------|--------|
+| `r_clip_eps` | Larger → more aggressive amplitude updates; risk instability |
+| `i_clip_eps` | Larger → more aggressive phase updates |
+| `n_ppo_steps` | Larger → more sample reuse, but staler $E_{\rm loc}$ |
+| `normalize_advantage` | Stabilises training when $\operatorname{Var}(A)$ varies |
