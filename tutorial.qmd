@@ -16,21 +16,16 @@ jupyter: python3
 
 ## Introduction
 
-The frustrated one-dimensional J₁-J₂ Heisenberg model is a benchmark for
-variational methods in quantum many-body physics:
+The frustrated one-dimensional J₁-J₂ Heisenberg model is a benchmark for variational methods in quantum many-body physics:
 
 $$
 H = J_1 \sum_{\langle i,j \rangle} \mathbf{S}_i \cdot \mathbf{S}_j
   + J_2 \sum_{\langle\langle i,j \rangle\rangle} \mathbf{S}_i \cdot \mathbf{S}_j
 $$
 
-At $J_2/J_1 = 0.5$ the system sits at the Majumdar–Ghosh point, where the
-spectral gap closes and quantum fluctuations are large — making accurate
-variational optimisation challenging.
+At $J_2/J_1 = 0.5$ the system sits at the Majumdar–Ghosh point, where the spectral gap closes and quantum fluctuations are large — making accurate variational optimisation challenging.
 
-We train a **ComplexRecurrentAR** autoregressive ansatz ($N = 12$ sites,
-$N_s = 1024$ samples per step) with the
-`ProximalWavefunctionOptimization` (PWO) driver and an Adam optimiser.
+We train a **ComplexRecurrentAR** autoregressive ansatz ($N = 12$ sites, $N_s = 1024$ samples per step) with the `ProximalWavefunctionOptimization` (PWO) driver and an Adam optimiser.
 
 Two convergence metrics are tracked throughout training:
 
@@ -38,8 +33,7 @@ Two convergence metrics are tracked throughout training:
 - **V-score** $V = N \operatorname{Var}(H) / E^2$ — a dimensionless proxy for
   proximity to the ground state (Nomura *et al.* 2021)
 
-Both are computed from exact (noise-free) expectation values obtained via
-full enumeration of the Hilbert space (`FullSumState`) at each optimiser step.
+Both are computed from exact (noise-free) expectation values obtained via full enumeration of the Hilbert space (`FullSumState`) at each optimiser step.
 
 
 
@@ -102,9 +96,7 @@ SEED = 123
 
 ### Building the J₁-J₂ Hamiltonian
 
-`nk.graph.Chain` with `max_neighbor_order=2` automatically assigns colour 0
-to NN edges and colour 1 to NNN edges, so no manual graph construction is
-needed.
+`nk.graph.Chain` with `max_neighbor_order=2` automatically assigns colour 0 to NN edges and colour 1 to NNN edges, so no manual graph construction is needed.
 
 ```{python}
 #| label: hamiltonian
@@ -143,20 +135,12 @@ print(f"Energy per site            E₀/N   = {E_exact / N:.8f}")
 
 ## Variational State Factory
 
-**ComplexRecurrentAR** is a single-backbone autoregressive NQS. A shared
-GRU trunk (with residual connections between layers) processes the causal
-token sequence; two MLP towers branch off to produce amplitude logits and
-phase values simultaneously for each site:
+**ComplexRecurrentAR** is a single-backbone autoregressive NQS. A shared GRU trunk (with residual connections between layers) processes the causal token sequence; two MLP towers branch off to produce amplitude logits and phase values simultaneously for each site:
 
-- **Amplitude tower** — `log_softmax` over local spin values, normalised to
-  give $\log p(\sigma_i|\sigma_{<i})$; real part of `conditionals_log_psi`.
-- **Phase tower** — per-site phase contributions whose sum (accumulated by
-  `AbstractARNN.__call__`) gives the total phase $\varphi(\boldsymbol\sigma)$;
-  imaginary part.
+- **Amplitude tower** — `log_softmax` over local spin values, normalised to give $\log p(\sigma_i|\sigma_{<i})$; real part of `conditionals_log_psi`.
+- **Phase tower** — per-site phase contributions whose sum (accumulated by `AbstractARNN.__call__`) gives the total phase $\varphi(\boldsymbol\sigma)$; imaginary part.
 
-The full ansatz is $\log\psi(\boldsymbol\sigma) = \log|\psi| + i\,\varphi$ with
-exact normalisation enforced by the amplitude tower. `ARDirectSampler` samples
-from $|\psi|^2$ using only the real part of `conditionals_log_psi`.
+The full ansatz is $\log\psi(\boldsymbol\sigma) = \log|\psi| + i\,\varphi$ with exact normalisation enforced by the amplitude tower. `ARDirectSampler` samples from $|\psi|^2$ using only the real part of `conditionals_log_psi`.
 
 ```{python}
 #| label: model
@@ -318,18 +302,12 @@ def train(driver, max_time: float = MAX_TRAIN_TIME, eval_every: int = 1):
 
 ### PWO + Adam
 
-**Proximal Wavefunction Optimization** extends the PPO clipping idea to
-complex-valued NQS via two independent channels:
+**Proximal Wavefunction Optimization** extends the PPO clipping idea to complex-valued NQS via two independent channels:
 
-- *Real channel* — clips the probability ratio
-  $r = \exp\!\bigl(2(\operatorname{Re}\log\psi_{\rm new} - \operatorname{Re}\log\psi_{\rm old})\bigr)$
-  to $[1-\varepsilon_r,\,1+\varepsilon_r]$.
-- *Imaginary channel* — clips the circular phase delta
-  $\delta = 2\arctan(\sin\Delta\varphi/\cos\Delta\varphi)$
-  to $[-\varepsilon_i,\,+\varepsilon_i]$.
+- *Real channel* — clips the probability ratio $r = \exp\!\bigl(2(\operatorname{Re}\log\psi_{\rm new} - \operatorname{Re}\log\psi_{\rm old})\bigr)$ to $[1-\varepsilon_r,\,1+\varepsilon_r]$.
+- *Imaginary channel* — clips the circular phase delta $\delta = 2\arctan(\sin\Delta\varphi/\cos\Delta\varphi)$ to $[-\varepsilon_i,\,+\varepsilon_i]$.
 
-Every `is_steps` optimiser steps a fresh batch is drawn and $E_{\rm loc}$
-is recomputed under the current parameters.
+Every `is_steps` optimiser steps a fresh batch is drawn and $E_{\rm loc}$ is recomputed under the current parameters.
 
 ```{python}
 #| label: pwo-driver
