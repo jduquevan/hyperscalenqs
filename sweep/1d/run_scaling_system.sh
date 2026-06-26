@@ -7,7 +7,7 @@
 #
 # Usage: bash sweep/run_scaling_system.sh
 
-for N in 8 16 24; do
+for N in 8 12 16; do
     export CHAIN_N=$N
     export N_SAMPLES=2048
     export N_GRU_LAYERS=3
