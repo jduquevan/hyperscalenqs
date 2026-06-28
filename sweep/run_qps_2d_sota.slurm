@@ -4,39 +4,37 @@
 #       Job blueprint        #
 ##############################
 
-# Give your job a name, so you can recognize it in the queue overview
-#SBATCH --job-name=qps
-
-# Remove one # to uncomment
+#SBATCH --job-name=qps_j1j2_square
 #SBATCH --output=/network/scratch/j/juan.duque/slurm_output/slurm-%j.out
 #SBATCH --error=/network/scratch/j/juan.duque/slurm_output/job-%j.out
 
-# Define how many nodes you need. Here, we ask for 1 node.
-#SBATCH -N 1 #nodes
-#SBATCH -n 1 #tasks
+#SBATCH -N 1
+#SBATCH -n 1
 #SBATCH --mem=40G
-#SBATCH --time=0-06:59:00
+#SBATCH --time=0-01:59:00
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --partition=long
 #SBATCH --cpus-per-task=6
 
-# Submit jobs.
 module purge
 eval "$(conda shell.bash hook)"
 conda deactivate
+
 export HYDRA_FULL_ERROR=1
 export HF_HOME="/home/mila/j/juan.duque/scratch/huggingface"
+export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"
+export TF_GPU_ALLOCATOR="cuda_malloc_async"
+
 source .venv/bin/activate
 
-# Define all arguments
-SEED=${1}
-ENV=${2}
+SEED=${1:-42}
+CONN_CHUNK_SIZE=${2:-8}
+N_SAMPLES=${3:-2048}
+PPO_EPOCHS=${4:-4}
+WANDB_MODE=${5:-online}
 
-# Construct the full command
-CMD="python -m src.llm.rwkv7_qps 'seed=${SEED}'"
+CMD="python -m src.2d.eval_hf_j1j2_square_sota"
 
-# Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"
 
-# Execute the command
 eval $CMD
