@@ -55,7 +55,7 @@ HEAD_HIDDEN=${HEAD_HIDDEN:-256}
 WANDB_PROJECT=${WANDB_PROJECT:-hyperscalenqs}
 RUN_NAME=${METHOD}_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}
 
-CMD="python src/1d/minsr.py \
+CMD="python src/scaling/minsr.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
     n_samples=${N_SAMPLES} \

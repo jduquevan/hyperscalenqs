@@ -4,7 +4,7 @@
 #       Job blueprint        #
 ##############################
 
-#SBATCH --job-name=adam
+#SBATCH --job-name=qps
 
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
@@ -12,7 +12,7 @@
 
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --mem=32G
+#SBATCH --mem=40G
 #SBATCH --time=0-04:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu-short
@@ -42,18 +42,17 @@ CHAIN_N=${CHAIN_N:-12}
 N_GRU_LAYERS=${N_GRU_LAYERS:-3}
 RNN_HIDDEN=${RNN_HIDDEN:-256}
 HEAD_HIDDEN=${HEAD_HIDDEN:-256}
-_DEFAULT_STEPS=$([ "$HAMILTONIAN" = "ising" ] && echo 5000 || echo 10000)
+_DEFAULT_STEPS=$([ "$HAMILTONIAN" = "ising" ] && echo 20000 || echo 40000)
 TRANSITION_STEPS=${TRANSITION_STEPS:-$_DEFAULT_STEPS}
 WANDB_PROJECT=${WANDB_PROJECT:-hyperscalenqs}
-RUN_NAME=${2:-adam_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}}
+RUN_NAME=${2:-qps_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}}
 
-CMD="python src/1d/adam.py \
+CMD="python src/scaling/qps.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
     n_samples=${N_SAMPLES} \
     transition_steps=${TRANSITION_STEPS} \
-    lr_peak=$([ "$HAMILTONIAN" = "ising" ] && echo 1e-4 || echo 3e-4) \
-    lr_div_factor=$([ "$HAMILTONIAN" = "ising" ] && echo 10.0 || echo 30.0) \
+    lr_peak=1e-4 \
     N=${CHAIN_N} \
     n_gru_layers=${N_GRU_LAYERS} \
     rnn_hidden=${RNN_HIDDEN} \
