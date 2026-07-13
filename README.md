@@ -1,10 +1,10 @@
 # HyperscaleNQS
 
-The repo compares three variational optimization methods on frustrated spin chains and lattices:
+This repository contains the code used for the experiments in:
 
-- **VMC (Adam)** — plain stochastic-gradient VMC with a cosine one-cycle learning-rate schedule.
-- **minSR / SPRING** — stochastic reconfiguration via the neural-tangent-kernel (NTK) trick, avoiding materialization of the full Jacobian for large networks.
-- **PWO (Proximal Wavefunction Optimization)** — a clipped, PPO-style dual-channel objective that optimizes the amplitude (real) and phase (imaginary) channels of `log ψ` separately.
+> Juan Agustín Duque, Sergio García Heredia, Vinicius Hernandes, Eliška Greplová, Thomas Spriggs, Aaron Courville, Anna Dawid. **"One More Time: Revisiting Neural Quantum States from a Reinforcement Learning Perspective."** [arXiv:2607.02292](https://arxiv.org/abs/2607.02292)
+
+which introduces **Proximal Wavefunction Optimization (PWO)**, a clipped, PPO-style dual-channel objective that optimizes the amplitude (real) and phase (imaginary) channels of `log ψ` separately.
 
 The default wavefunction ansatz is `ComplexRecurrentAR`, an autoregressive network with a shared GRU trunk feeding separate amplitude and phase towers, sampled exactly via NetKet's `ARDirectSampler`.
 
