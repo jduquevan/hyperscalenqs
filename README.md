@@ -1,10 +1,10 @@
 # HyperscaleNQS
 
-The repo compares three variational optimization methods on frustrated spin chains and lattices:
+This repository contains the code used for the experiments in:
 
-- **VMC (Adam)** — plain stochastic-gradient VMC with a cosine one-cycle learning-rate schedule.
-- **minSR / SPRING** — stochastic reconfiguration via the neural-tangent-kernel (NTK) trick, avoiding materialization of the full Jacobian for large networks.
-- **PWO (Proximal Wavefunction Optimization)** — a clipped, PPO-style dual-channel objective that optimizes the amplitude (real) and phase (imaginary) channels of `log ψ` separately.
+> Juan Agustín Duque, Sergio García Heredia, Vinicius Hernandes, Eliška Greplová, Thomas Spriggs, Aaron Courville, Anna Dawid. **"One More Time: Revisiting Neural Quantum States from a Reinforcement Learning Perspective."** [arXiv:2607.02292](https://arxiv.org/abs/2607.02292)
+
+which introduces **Proximal Wavefunction Optimization (PWO)**, a clipped, PPO-style dual-channel objective that optimizes the amplitude (real) and phase (imaginary) channels of `log ψ` separately.
 
 The default wavefunction ansatz is `ComplexRecurrentAR`, an autoregressive network with a shared GRU trunk feeding separate amplitude and phase towers, sampled exactly via NetKet's `ARDirectSampler`.
 
@@ -12,22 +12,22 @@ The default wavefunction ansatz is `ComplexRecurrentAR`, an autoregressive netwo
 
 ```
 src/
-├── adam.py, minsr.py, qps.py   # 1D chain algorithms (Ising / Heisenberg / J1-J2)
+├── adam.py, minsr.py, pwo.py   # 1D chain algorithms (Ising / Heisenberg / J1-J2)
 ├── 2d/                         # 2D square-lattice J1-J2 (PWO + SOTA eval, ViT-RoPE ansatz)
-├── scaling/                    # Variants of adam/minsr/qps for scaling experiments
+├── scaling/                    # Variants of adam/minsr/pwo for scaling experiments
 └── llm/                        # RWKV-7 backbone integration as an NQS ansatz for PWO
 
 sweep/
-├── run_adam.slurm, run_minsr.slurm, run_qps.slurm, run_qps_llm.slurm, run_qps_2d_*.slurm
+├── run_adam.slurm, run_minsr.slurm, run_pwo.slurm, run_pwo_llm.slurm, run_pwo_2d_*.slurm
 ├── chains/run_chains.sh        # Launches all algorithms across {ising, heisenberg, j1j2}
 ├── scaling/                    # Scaling sweeps (model size, system size, sample count)
-├── submit_minsr_grid.sh, submit_qps_grid.sh, sweep_pwo.py
+├── submit_minsr_grid.sh, submit_pwo_grid.sh, sweep_pwo.py
 └── ...
 
 analysis/
 └── count_parameters.py         # Model parameter counting utility
 
-submit_qps_sweep.py              # Randomized hyperparameter sweep submitter (SLURM)
+submit_pwo_sweep.py              # Randomized hyperparameter sweep submitter (SLURM)
 tutorial.ipynb                   # End-to-end walkthrough of PWO on J1-J2 (N=12)
 ```
 
@@ -54,7 +54,7 @@ python src/adam.py hamiltonian=j1j2 seed=42
 python src/minsr.py hamiltonian=j1j2 seed=42
 
 # PWO
-python src/qps.py hamiltonian=j1j2 seed=42
+python src/pwo.py hamiltonian=j1j2 seed=42
 ```
 
 Common Hydra options: `hamiltonian` (`ising`/`heisenberg`/`j1j2`), `N`, `J1`, `J2`, `pbc`, `n_samples`, learning-rate schedule params, and `wandb_project`/`wandb_mode` for logging.
@@ -66,7 +66,7 @@ Common Hydra options: `hamiltonian` (`ising`/`heisenberg`/`j1j2`), `N`, `J1`, `J
 bash sweep/scaling/run_scaling_model.sh
 
 # Randomized hyperparameter sweep for PWO
-python submit_qps_sweep.py --slurm_script=sweep/run_qps.slurm --hamiltonian=j1j2 --n_runs=20
+python submit_pwo_sweep.py --slurm_script=sweep/run_pwo.slurm --hamiltonian=j1j2 --n_runs=20
 ```
 
 ### Tutorial

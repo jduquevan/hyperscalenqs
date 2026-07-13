@@ -28,5 +28,5 @@ for SIZE_SPEC in "tiny:1:64:64" "small:2:128:128" "medium:3:256:256"; do
 
     sbatch sweep/scaling/run_adam.slurm j1j2
     sbatch sweep/scaling/run_minsr.slurm j1j2 minsr
-    sbatch sweep/scaling/run_qps.slurm j1j2
+    sbatch sweep/scaling/run_pwo.slurm j1j2
 done

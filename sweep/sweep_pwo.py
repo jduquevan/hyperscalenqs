@@ -8,8 +8,8 @@ import subprocess
 import fire
 
 
-SLURM = "sweep/run_qps_2d.slurm"
-MODULE = "src.2d.qps_j1j2_square_kv_cache_with_prefix_magnetization_features"
+SLURM = "sweep/run_pwo_2d.slurm"
+MODULE = "src.2d.pwo_j1j2_square_kv_cache_with_prefix_magnetization_features"
 
 SEED = 42
 CONN_CHUNK_SIZE = 8

@@ -25,10 +25,10 @@ def _fmt(x: float) -> str:
 
 def submit(
     n_runs: int = 20,
-    slurm_script: str = "sweep/run_qps.slurm",
+    slurm_script: str = "sweep/run_pwo.slurm",
     hamiltonian: str = "j1j2",
     wandb_tag: str = "random_sweep",
-    run_prefix: str = "qps",
+    run_prefix: str = "pwo",
     start_seed: int = 42,
     sweep_seed: int = 0,
     lrs: str = "3e-5,1e-4,3e-4",

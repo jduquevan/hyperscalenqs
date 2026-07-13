@@ -59,7 +59,7 @@ class Args:
     chunk_size_bwd: Optional[int] = None
     mode: str = "complex"         # complex wavefunction
 
-    # Architecture: match qps.py
+    # Architecture: match pwo.py
     embed_dim: int = 32
     rnn_hidden: int = 256
     head_hidden: int = 256

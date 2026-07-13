@@ -2,7 +2,7 @@
 set -euo pipefail
 
 for SEED in $(seq 42 51); do
-    sbatch sweep/run_qps.slurm \
+    sbatch sweep/run_pwo.slurm \
         "${SEED}" \
         "adam_ising_seed_${SEED}" \
         "ising" \
@@ -13,7 +13,7 @@ for SEED in $(seq 42 51); do
 done
 
 # for SEED in $(seq 42 51); do
-#     sbatch sweep/run_qps.slurm \
+#     sbatch sweep/run_pwo.slurm \
 #         "${SEED}" \
 #         "adam_heisenberg_chain_seed_${SEED}" \
 #         "heisenberg" \
@@ -24,7 +24,7 @@ done
 # done
 
 # for SEED in $(seq 42 51); do
-#     sbatch sweep/run_qps.slurm \
+#     sbatch sweep/run_pwo.slurm \
 #         "${SEED}" \
 #         "adam_j1j2_seed_${SEED}" \
 #         "j1j2" \

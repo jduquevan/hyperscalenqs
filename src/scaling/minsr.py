@@ -54,7 +54,7 @@ class Args:
     mode: str = "complex"         # complex wavefunction
     sr_momentum: float = 0.0      # 0.0 => minSR, 0.8 => SPRING
 
-    # Architecture: match qps.py
+    # Architecture: match pwo.py
     embed_dim: int = 32
     rnn_hidden: int = 256
     head_hidden: int = 256

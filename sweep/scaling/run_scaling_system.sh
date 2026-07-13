@@ -19,5 +19,5 @@ for N in 8 12 16; do
 
     sbatch sweep/scaling/run_adam.slurm j1j2
     sbatch sweep/scaling/run_minsr.slurm j1j2 minsr
-    sbatch sweep/scaling/run_qps.slurm j1j2
+    sbatch sweep/scaling/run_pwo.slurm j1j2
 done
