@@ -4,7 +4,7 @@
 #       Job blueprint        #
 ##############################
 
-#SBATCH --job-name=qps_j1j2_square
+#SBATCH --job-name=pwo_j1j2_square
 #SBATCH --output=/network/scratch/j/juan.duque/slurm_output/slurm-%j.out
 #SBATCH --error=/network/scratch/j/juan.duque/slurm_output/job-%j.out
 

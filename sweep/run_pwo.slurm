@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=qps
+#SBATCH --job-name=pwo
 #SBATCH --output=/network/scratch/j/juan.duque/slurm_output/slurm-%j.out
 #SBATCH --error=/network/scratch/j/juan.duque/slurm_output/job-%j.out
 #SBATCH -N 1
@@ -27,7 +27,7 @@ shift 4
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python src/qps.py
+    python src/pwo.py
     "seed=${SEED}"
     "wandb_run_name=${RUN_NAME}"
     "hamiltonian=${HAMILTONIAN}"

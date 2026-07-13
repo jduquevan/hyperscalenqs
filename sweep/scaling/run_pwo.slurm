@@ -4,7 +4,7 @@
 #       Job blueprint        #
 ##############################
 
-#SBATCH --job-name=qps
+#SBATCH --job-name=pwo
 
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
@@ -45,9 +45,9 @@ HEAD_HIDDEN=${HEAD_HIDDEN:-256}
 _DEFAULT_STEPS=$([ "$HAMILTONIAN" = "ising" ] && echo 20000 || echo 40000)
 TRANSITION_STEPS=${TRANSITION_STEPS:-$_DEFAULT_STEPS}
 WANDB_PROJECT=${WANDB_PROJECT:-hyperscalenqs}
-RUN_NAME=${2:-qps_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}}
+RUN_NAME=${2:-pwo_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}}
 
-CMD="python src/scaling/qps.py \
+CMD="python src/scaling/pwo.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
     n_samples=${N_SAMPLES} \

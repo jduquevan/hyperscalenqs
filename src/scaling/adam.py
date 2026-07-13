@@ -51,7 +51,7 @@ class Args:
     adam_b2: float = 0.999
     adam_eps: float = 1e-8
 
-    # Architecture: match qps.py / minsr.py
+    # Architecture: match pwo.py / minsr.py
     embed_dim: int = 32
     rnn_hidden: int = 256
     head_hidden: int = 256

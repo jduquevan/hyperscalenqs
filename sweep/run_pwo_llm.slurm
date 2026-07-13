@@ -5,7 +5,7 @@
 ##############################
 
 # Give your job a name, so you can recognize it in the queue overview
-#SBATCH --job-name=qps
+#SBATCH --job-name=pwo
 
 # Remove one # to uncomment
 #SBATCH --output=/network/scratch/j/juan.duque/slurm_output/slurm-%j.out
@@ -33,7 +33,7 @@ SEED=${1}
 ENV=${2}
 
 # Construct the full command
-CMD="python -m src.llm.rwkv7_qps 'seed=${SEED}'"
+CMD="python -m src.llm.rwkv7_pwo 'seed=${SEED}'"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"
