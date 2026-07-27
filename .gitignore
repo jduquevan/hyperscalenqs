@@ -1,0 +1,14 @@
+wandb/
+outputs/
+logs/*
+!logs/.gitkeep
+checkpoints/
+.venv/
+.ipynb_checkpoints/
+.cache/
+hf_cache/
+hub/
+*.pyc
+notebooks/
+*.pdf
+.env
