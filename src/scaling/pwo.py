@@ -423,9 +423,15 @@ def main(cfg: Args) -> None:
         if cfg.normalize_imag_advantage:
             adv_phase = adv_phase / (jnp.std(adv_phase) + 1e-8)
 
-        phase_delta = jnp.atan2(
-            jnp.sin(new_phase - old_phase),
-            jnp.cos(new_phase - old_phase),
+        log_z = new_logpsi - (old_logp / cfg.machine_pow + 1j * old_phase)
+        shift = jax.lax.stop_gradient(jnp.max(jnp.real(log_z)))
+        overlap = jnp.mean(jnp.exp(log_z - shift))
+        safe_overlap = jnp.where(overlap != 0, overlap, jnp.ones_like(overlap))
+        gamma = jnp.angle(safe_overlap)
+        phase_diff = jnp.imag(log_z) - gamma
+        phase_delta = 2 * jnp.atan2(
+            jnp.sin(phase_diff),
+            jnp.cos(phase_diff),
         )
 
         is_ratio = jax.lax.stop_gradient(ratio_real)
