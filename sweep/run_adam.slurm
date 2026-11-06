@@ -47,13 +47,14 @@ TRANSITION_STEPS=${TRANSITION_STEPS:-$_DEFAULT_STEPS}
 WANDB_PROJECT=${WANDB_PROJECT:-hyperscalenqs}
 RUN_NAME=${2:-adam_${HAMILTONIAN}${RUN_TAG:+_${RUN_TAG}}_seed_${SEED}}
 
-CMD="python src/scaling/adam.py \
+CMD="python src/chains/adam.py \
     seed=${SEED} \
     hamiltonian=${HAMILTONIAN} \
     n_samples=${N_SAMPLES} \
     transition_steps=${TRANSITION_STEPS} \
-    lr_peak=$([ "$HAMILTONIAN" = "ising" ] && echo 1e-4 || echo 3e-4) \
-    lr_div_factor=$([ "$HAMILTONIAN" = "ising" ] && echo 10.0 || echo 30.0) \
+    lr_peak=3e-4 \
+    lr_div_factor=10.0 \
+    lr_final_div_factor=200.0 \
     N=${CHAIN_N} \
     n_gru_layers=${N_GRU_LAYERS} \
     rnn_hidden=${RNN_HIDDEN} \

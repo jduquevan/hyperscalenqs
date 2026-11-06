@@ -48,16 +48,16 @@ All entry points are Hydra scripts configured via `@dataclass` args, so any fiel
 
 ```bash
 # VMC with Adam
-python src/adam.py hamiltonian=j1j2 seed=42
+python src/chains/adam.py hamiltonian=j1j2 seed=42
 
 # minSR / SPRING
-python src/minsr.py hamiltonian=j1j2 seed=42
+python src/chains/minsr.py hamiltonian=j1j2 seed=42 n_samples=1024
 
 # PWO
-python src/pwo.py hamiltonian=j1j2 seed=42
+python src/chains/pwo.py hamiltonian=j1j2 seed=42 n_samples=1024
 ```
 
-Common Hydra options: `hamiltonian` (`ising`/`heisenberg`/`j1j2`), `N`, `J1`, `J2`, `pbc`, `n_samples`, learning-rate schedule params, and `wandb_project`/`wandb_mode` for logging.
+Common Hydra options: `hamiltonian` (`ising`/`heisenberg`/`j1j2`), `N`, `J1`, `J2`, `n_samples`, learning-rate schedule params, and `wandb_project`/`wandb_mode` for logging. The chain entrypoints use periodic boundaries for Ising; `pbc` applies to the Heisenberg chains.
 
 ### SLURM sweeps
 
@@ -66,7 +66,7 @@ Common Hydra options: `hamiltonian` (`ising`/`heisenberg`/`j1j2`), `N`, `J1`, `J
 bash sweep/scaling/run_scaling_model.sh
 
 # Randomized hyperparameter sweep for PWO
-python submit_pwo_sweep.py --slurm_script=sweep/run_pwo.slurm --hamiltonian=j1j2 --n_runs=20
+python submit_pwo_sweep.py submit --hamiltonian=j1j2 --n_runs=20
 ```
 
 ### Tutorial

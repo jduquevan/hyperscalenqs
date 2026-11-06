@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import jax
 import jax.numpy as jnp
 import netket as nk
-from pwo import ComplexRecurrentAR
+from chains.pwo import ComplexRecurrentAR
 
 N_SITES = 12
 hilbert = nk.hilbert.Spin(s=0.5, N=N_SITES)

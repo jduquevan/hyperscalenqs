@@ -20,13 +20,12 @@ for SIZE_SPEC in "tiny:1:64:64" "small:2:128:128" "medium:3:256:256"; do
     export N_GRU_LAYERS=$LAYERS
     export RNN_HIDDEN=$HIDDEN
     export HEAD_HIDDEN=$HEAD
-    export N_SAMPLES=2048
+    export N_SAMPLES=1024
     export CHAIN_N=12
-    export TRANSITION_STEPS=40000
     export WANDB_PROJECT=scaling-model
     export RUN_TAG=$SIZE
 
-    sbatch sweep/scaling/run_adam.slurm j1j2
-    sbatch sweep/scaling/run_minsr.slurm j1j2 minsr
-    sbatch sweep/scaling/run_pwo.slurm j1j2
+    TRANSITION_STEPS=10000 sbatch sweep/run_adam.slurm j1j2
+    sbatch sweep/run_minsr.slurm j1j2 minsr
+    PPO_EPOCHS=4 TRANSITION_STEPS=40000 sbatch sweep/run_pwo.slurm j1j2
 done

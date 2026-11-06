@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -25,7 +26,6 @@ def _fmt(x: float) -> str:
 
 def submit(
     n_runs: int = 20,
-    slurm_script: str = "sweep/run_pwo.slurm",
     hamiltonian: str = "j1j2",
     wandb_tag: str = "random_sweep",
     run_prefix: str = "pwo",
@@ -38,10 +38,6 @@ def submit(
     extra_args: str = "",
     dry_run: bool = False,
 ):
-    script_path = Path(slurm_script)
-    if not script_path.exists():
-        raise FileNotFoundError(f"Slurm script not found: {slurm_script}")
-
     lr_values = _parse_list(lrs, float)
     ppo_epoch_values = _parse_list(ppo_epochs, int)
     clip_values = _parse_list(ppo_clip_eps, float)
@@ -56,8 +52,11 @@ def submit(
     if not phase_delta_values:
         raise ValueError("Empty phase_delta_clip list.")
 
-    shared_extra_args = extra_args.split() if extra_args.strip() else []
+    shared_extra_args = shlex.split(extra_args)
     rng = random.Random(sweep_seed)
+
+    if not dry_run:
+        Path("logs").mkdir(parents=True, exist_ok=True)
 
     for i in range(n_runs):
         seed = start_seed + i
@@ -77,26 +76,48 @@ def submit(
         )
 
         overrides = [
+            f"seed={seed}",
+            f"hamiltonian={hamiltonian}",
+            "n_samples=1024",
             f"lr={_fmt(lr)}",
-            f"peak_lr={_fmt(lr)}",
+            f"lr_peak={_fmt(lr)}",
             f"ppo_epochs={epochs}",
             f"ppo_clip_eps={_fmt(clip)}",
             f"phase_delta_clip={_fmt(dphi)}",
             f"transition_steps={transition_steps}",
+            f"wandb_run_name={run_name}",
             *shared_extra_args,
         ]
 
+        training_command = shlex.join(["python", "src/chains/pwo.py", *overrides])
+        job_script = "\n".join([
+            "set -e",
+            "module purge",
+            "module load ALICE/default",
+            "module load CUDA/12.4.0",
+            "export HYDRA_FULL_ERROR=1",
+            "source .venv/bin/activate",
+            'set -a; if [[ -f "$SLURM_SUBMIT_DIR/.env" ]]; then source "$SLURM_SUBMIT_DIR/.env"; fi; set +a',
+            f"export WANDB_TAGS={shlex.quote(wandb_tag)}",
+            f"exec {training_command}",
+        ])
         cmd = [
             "sbatch",
-            str(script_path),
-            str(seed),
-            run_name,
-            hamiltonian,
-            wandb_tag,
-            *overrides,
+            "--job-name=pwo",
+            "--output=logs/%x_%j.out",
+            "--error=logs/%x_%j.err",
+            "--nodes=1",
+            "--ntasks=1",
+            "--mem=40G",
+            "--time=0-04:00:00",
+            "--gres=gpu:1",
+            "--partition=gpu-short",
+            "--constraint=A100.80G",
+            "--cpus-per-task=8",
+            "--wrap", shlex.join(["bash", "-c", job_script]),
         ]
 
-        print(f"[{i+1}/{n_runs}] {' '.join(cmd)}")
+        print(f"[{i+1}/{n_runs}] {shlex.join(cmd)}")
 
         if not dry_run:
             subprocess.run(cmd, check=True)

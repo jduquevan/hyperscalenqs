@@ -54,7 +54,7 @@ class Args:
     sgd_momentum: float = 0.0
     decay_rate: float = 0.5
     transition_steps: int = 40000
-    use_phase_jacobian_baseline: bool = True
+    use_phase_jacobian_baseline: bool = False
     phase_jacobian_baseline_eps: float = 1e-8
 
     # LR schedule
@@ -137,11 +137,8 @@ def make_tx(cfg: Args):
     #     end_value=cfg.final_lr,
     # )
 
-    # Scale transition_steps by ppo_epochs so the schedule evolves on
-    # the outer-iteration timescale (as stated in the paper appendix).
-    schedule_steps = cfg.transition_steps * cfg.ppo_epochs
     lr_schedule = optax.schedules.cosine_onecycle_schedule(
-        transition_steps=schedule_steps,
+        transition_steps=cfg.transition_steps,
         peak_value=cfg.lr_peak,
         pct_start=cfg.lr_pct_start,
         div_factor=cfg.lr_div_factor,
