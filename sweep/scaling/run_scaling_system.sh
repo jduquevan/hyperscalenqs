@@ -13,7 +13,7 @@ for N in 8 12 16; do
     export N_GRU_LAYERS=3
     export RNN_HIDDEN=256
     export HEAD_HIDDEN=256
-    export WANDB_PROJECT=scaling-system
+    export WANDB_PROJECT=scaling-system-corrected
     export RUN_TAG=N${N}
 
     TRANSITION_STEPS=10000 sbatch sweep/run_adam.slurm j1j2

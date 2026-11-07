@@ -13,7 +13,7 @@ for S in 512 1024 2048; do
     export N_GRU_LAYERS=3
     export RNN_HIDDEN=256
     export HEAD_HIDDEN=256
-    export WANDB_PROJECT=scaling-samples
+    export WANDB_PROJECT=scaling-samples-corrected
     export RUN_TAG=n${S}
 
     TRANSITION_STEPS=10000 sbatch sweep/run_adam.slurm j1j2

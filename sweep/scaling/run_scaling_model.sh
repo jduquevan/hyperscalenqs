@@ -22,7 +22,7 @@ for SIZE_SPEC in "tiny:1:64:64" "small:2:128:128" "medium:3:256:256"; do
     export HEAD_HIDDEN=$HEAD
     export N_SAMPLES=1024
     export CHAIN_N=12
-    export WANDB_PROJECT=scaling-model
+    export WANDB_PROJECT=scaling-model-corrected
     export RUN_TAG=$SIZE
 
     TRANSITION_STEPS=10000 sbatch sweep/run_adam.slurm j1j2
